@@ -335,6 +335,11 @@ input[type=range]{width:100%;accent-color:var(--a)}
 .nextcard .body{flex-wrap:wrap}.nextcard .grow{flex:1 1 220px}
 @media (max-width:760px){.nextcard .nbtns{width:100%;justify-content:flex-start!important;padding-left:58px}}
 @media (max-width:760px){.topbar .simpletog{display:none}}
+.obhead,.obrow{display:grid;grid-template-columns:34px minmax(0,1fr) 104px 150px 156px 34px;gap:8px;align-items:center}
+.obhead{font-size:.7em;letter-spacing:.12em;text-transform:uppercase;color:var(--ink2);font-weight:500;padding-bottom:6px}
+.obrow{padding:7px 0;border-top:1px solid var(--line)}.obrow .e{text-align:center;font-size:1.15em}
+.ob{max-width:760px}
+@media (max-width:760px){.obhead{display:none}.obrow{grid-template-columns:30px minmax(0,1fr) minmax(0,1fr) 34px;row-gap:6px}.obrow [data-obf=name]{grid-column:2/4}.obrow .iconbtn{grid-column:4;grid-row:1}.obrow [data-obf=amount]{grid-column:2}.obrow select{grid-column:3}.obrow [data-obf=next]{grid-column:2/4}}
 </style></head>
 <body data-theme="Blush"><div id="root"></div>
 <script>window.BP_DEMO=false;window.BP_SHOP="https://www.etsy.com/shop/TrueHavenStudios";window.BP_VERSION="1.0.0";</script>
@@ -1559,27 +1564,48 @@ function vOnboard() {
     <div class="frow">${field("How often", `<select class="inp" id="obFreq">${["weekly", "biweekly", "semimonthly", "monthly", "4weekly"].map(k => opt(k, FREQ[k][0].toUpperCase() + FREQ[k].slice(1), d.freq || "biweekly")).join("")}</select>`)}${field("Next payday", inp("obNext", d.next || E.addDays(today(), 7), { type: "date" }))}</div>
     ${field("Money in your everyday account right now", moneyInp("obBal", d.bal || ""), "From your bank app – used to look ahead.")}</div>
     <div class="row sb mt"><button class="btn" data-act="obBack">${ic("left")}Back</button><div class="row"><button class="link" data-act="obSkip">Skip</button><button class="btn pri" data-act="obNext">Next ${ic("right")}</button></div></div>`;
-  else body = `<div class="caps">Step 3 of 3</div><h1 style="margin:6px 0 10px">Your regular bills</h1><p class="muted">Type the ones you have – leave the rest empty. You can add more any time.</p>
-    <div class="card pad">${OB_BILLS.map(([id, n, e, k], i) => `<div class="erow"><span class="e">${e}</span><span class="n">${n}</span><input class="inp sm a" id="obb${i}" inputmode="decimal" placeholder="amount" value="${esc((d.bills || {})[i]?.a || "")}"><input class="inp sm a" id="obd${i}" inputmode="numeric" placeholder="day" value="${esc((d.bills || {})[i]?.d || "")}" style="width:64px"></div>`).join("")}</div>
+  else {
+    if (!d.bills) d.bills = OB_START.map(n => obRow(n));
+    const fq = v => `<select class="inp sm" data-obf="freq">${OB_FREQ.map(([k, l]) => opt(k, l, v)).join("")}</select>`;
+    body = `<div class="caps">Step 3 of 3</div><h1 style="margin:6px 0 10px">What do you pay regularly?</h1><p class="muted">Fill in what you have, remove what you don't, add anything that's missing. Monthly, yearly, every 3 months – all fine. Empty rows are skipped.</p>
+    <div class="card pad"><div class="obhead"><span></span><span>What</span><span>Amount</span><span>How often</span><span>Next payment</span><span></span></div>
+    ${d.bills.map((r, i) => `<div class="obrow" data-i="${i}"><span class="e">${r.emoji}</span><input class="inp sm" data-obf="name" value="${esc(r.name)}" placeholder="Name"><input class="inp sm" data-obf="amount" inputmode="decimal" placeholder="amount" value="${esc(r.amount)}">${fq(r.freq)}<input class="inp sm" data-obf="next" type="date" value="${esc(r.next)}"><button class="iconbtn" data-act="obDel" data-i="${i}" aria-label="Remove">${ic("x")}</button></div>`).join("")}
+    <button class="btn pri" data-act="obAdd" data-n="" style="width:100%;justify-content:center;margin-top:14px">${ic("plus")}Add your own – anything not listed</button>
+    <div class="caps" style="margin:18px 0 8px">Or tap a common one</div><div class="row wrap" style="gap:6px">${OB_MORE.filter(n => !d.bills.some(r => r.name === n)).map(n => `<button class="cat" data-act="obAdd" data-n="${esc(n)}">+ ${esc(n)}</button>`).join("")}</div>
+    <p class="help" style="margin-top:12px">No date? It starts on the 1st of next month – you can change it any time in Bills & income. A second income goes there too.</p></div>
     <div class="row sb mt"><button class="btn" data-act="obBack">${ic("left")}Back</button><button class="btn pri" data-act="obDone">Open my planner ${ic("right")}</button></div>`;
+  }
   return `<div class="ob">${steps}${body}</div>`;
 }
-const OB_BILLS = [["rent", "Rent / mortgage", "🏠", "bill"], ["utilities", "Electricity & water", "💡", "bill"], ["phone", "Phone", "📱", "bill"], ["phone", "Internet", "🌐", "bill"], ["insurance", "Insurance", "🛡️", "bill"], ["transport", "Car / transit pass", "🚗", "bill"], ["subs", "Netflix", "🎬", "sub"], ["subs", "Spotify", "🎧", "sub"], ["subs", "Gym", "🏋️", "sub"]];
+const OB_FREQ = [["monthly", "Monthly"], ["yearly", "Yearly"], ["quarterly", "Every 3 months"], ["halfyearly", "Every 6 months"], ["biweekly", "Every 2 weeks"], ["weekly", "Weekly"]];
+const OB_START = ["Rent / mortgage", "Electricity & water", "Phone", "Internet", "Netflix", "Spotify", "Gym"];
+const OB_MORE = ["Health insurance", "Car insurance", "Car payment", "Transit pass", "Renter's insurance", "Loan payment", "Credit card", "Childcare", "Pet insurance", "Disney+", "Amazon Prime", "YouTube Premium", "iCloud", "Apple Music", "Gaming", "Software", "Donation"];
+const OB_GUESS = [[/rent|mortgage/i, "rent", "🏠", "bill"], [/electric|water|gas|heat|energy|utilit/i, "utilities", "💡", "bill"], [/phone|internet|wifi|mobile/i, "phone", "📱", "bill"],
+  [/insurance/i, "insurance", "🛡️", "bill"], [/car|transit|bus|train|parking|fuel/i, "transport", "🚗", "bill"], [/health|doctor|dental/i, "health", "💊", "bill"],
+  [/netflix|spotify|disney|prime|youtube|icloud|apple|hulu|hbo|music|gaming|game|software|adobe|patreon|gym|fitness|club/i, "subs", "🔁", "sub"], [/pet|dog|cat\b/i, "other", "🐾", "bill"],
+  [/loan|credit|debt/i, "other", "💳", "bill"], [/child|school|daycare/i, "other", "🧸", "bill"], [/donat|charity/i, "gifts", "🤍", "bill"]];
+function obGuess(n) { const g = OB_GUESS.find(([re]) => re.test(n || "")); return g ? { cat: g[1], emoji: g[2], kind: g[3] } : { cat: "other", emoji: "🧾", kind: "bill" }; }
+function obRow(name) { return { name, amount: "", freq: /prime|insurance/i.test(name) && /prime/i.test(name) ? "yearly" : "monthly", next: "", emoji: obGuess(name).emoji }; }
 function obCollect() {
   if (OB.step === 0) { S.settings.name = val("obName").trim(); S.settings.currency = val("obCur"); _nf = {}; }
   if (OB.step === 1) Object.assign(OB.d, { pay: val("obPay"), freq: val("obFreq"), next: val("obNext"), bal: val("obBal") });
-  if (OB.step === 2) { OB.d.bills = {}; OB_BILLS.forEach((_, i) => { OB.d.bills[i] = { a: val("obb" + i), d: val("obd" + i) }; }); }
+  if (OB.step === 2 && OB.d.bills) document.querySelectorAll(".obrow").forEach(row => {
+    const r = OB.d.bills[+row.dataset.i]; if (!r) return;
+    row.querySelectorAll("[data-obf]").forEach(el => { r[el.dataset.obf] = el.value; });
+    r.emoji = obGuess(r.name).emoji;
+  });
 }
 function obFinish() {
   obCollect();
   const t = today(), d = OB.d;
   const pay = num(d.pay); if (pay > 0 && d.next) S.rec.push({ id: uid(), kind: "income", name: "Paycheck", amount: E.r2(pay), freq: d.freq, start: d.next, added: t, skip: {}, cat: "" });
   const bal = num(d.bal); if (bal >= 0 && !isNaN(bal)) Object.assign(S.accounts[0], { amount: E.r2(bal), date: t });
-  OB_BILLS.forEach(([cat, name, e, kind], i) => {
-    const b = (d.bills || {})[i] || {}, a = num(b.a); if (!(a > 0)) return;
-    const day = clamp(parseInt(b.d) || 1, 1, 31); let s = `${t.slice(0, 8)}${E.pad(Math.min(day, E.dim(+t.slice(0, 4), +t.slice(5, 7) - 1)))}`; if (s < t) s = E.addMonths(s, 1, day);
-    S.rec.push({ id: uid(), kind, name, amount: E.r2(a), freq: "monthly", start: s, cat, added: t, skip: {} });
-    const c = S.cats.find(x => x.id === cat); if (c && kind === "bill") c.budget = E.r2((+c.budget || 0) + a);
+  const firstNext = E.addMonths(t.slice(0, 8) + "01", 1, 1);
+  (d.bills || []).forEach(b => {
+    const a = num(b.amount), name = (b.name || "").trim(); if (!(a > 0) || !name) return;
+    const g = obGuess(name), freq = b.freq || "monthly";
+    S.rec.push({ id: uid(), kind: g.kind, name, amount: E.r2(a), freq, start: b.next || firstNext, cat: S.cats.some(c => c.id === g.cat) ? g.cat : "other", added: t, skip: {} });
+    const c = S.cats.find(x => x.id === g.cat); if (c && g.kind === "bill") c.budget = E.r2((+c.budget || 0) + E.perMonth({ freq, amount: a }));
   });
   const subsC = S.cats.find(c => c.id === "subs"); if (subsC) subsC.budget = E.r2(E.sum(S.rec.filter(r => r.kind === "sub"), E.perMonth));
   S.setup = true; save(); go("home"); render();
@@ -1812,6 +1838,8 @@ const ACT = {
   resetOk: () => { if (DEMO) return toast("Not in the demo."); const keep = { theme: S.settings.theme, currency: S.settings.currency }; S = blank(); Object.assign(S.settings, keep); OB = { step: 0, d: {} }; flush(); closeModal(); location.hash = ""; render(); },
   setTheme: d => { if (!S.setup && !DEMO) obCollect(); S.settings.theme = d.v; save(); render(); }, setDark: d => { S.settings.dark = d.v; save(); render(); },
   // onboarding
+  obAdd: d => { obCollect(); OB.d.bills.push(obRow(d.n)); render(); const rows = document.querySelectorAll('.obrow [data-obf="' + (d.n ? 'amount' : 'name') + '"]'); rows.length && rows[rows.length - 1].focus(); },
+  obDel: d => { obCollect(); OB.d.bills.splice(+d.i, 1); render(); },
   obNext: () => { obCollect(); OB.step++; render(); }, obBack: () => { obCollect(); OB.step--; render(); }, obSkip: () => { OB.d.pay = ""; OB.step++; render(); }, obDone: () => obFinish(),
   obSample: () => { const s = window.BP_SAMPLE(); s.settings.theme = S.settings.theme; s.settings.currency = val("obCur") || S.settings.currency; s.sample = true; S = migrate(s); S.setup = true; S.sample = true; save(); go("home"); render(); toast("This is example data – Settings › Start fresh clears it."); },
   simple: d => { S.settings.simple = d.v === "1"; save(); render(); },

@@ -1,0 +1,28 @@
+{
+ "name": "Budget Planner \u2013 TrueHaven Studios",
+ "short_name": "Budget",
+ "start_url": "./index.html",
+ "scope": "./",
+ "display": "standalone",
+ "background_color": "#F8F4F0",
+ "theme_color": "#F8F4F0",
+ "description": "Safe to spend today, bills, paychecks, goals, debt payoff and net worth.",
+ "icons": [
+  {
+   "src": "icon-192.png",
+   "sizes": "192x192",
+   "type": "image/png"
+  },
+  {
+   "src": "icon-512.png",
+   "sizes": "512x512",
+   "type": "image/png"
+  },
+  {
+   "src": "icon-maskable-512.png",
+   "sizes": "512x512",
+   "type": "image/png",
+   "purpose": "maskable"
+  }
+ ]
+}

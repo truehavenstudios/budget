@@ -349,6 +349,9 @@ input[type=range]{width:100%;accent-color:var(--a)}
 .item.paid .nm{text-decoration:line-through;text-decoration-color:var(--ink3);color:var(--ink2)}
 .item.paid .amt{color:var(--ink2)}
 .ev.paid{opacity:.55}
+details.ended{margin-top:6px;border-top:1px solid var(--line)}
+details.ended summary{cursor:pointer;padding:10px 4px;list-style-position:inside}
+details.ended .item{opacity:.7}
 </style></head>
 <body data-theme="Blush"><div id="root"></div>
 <script>window.BP_DEMO=true;window.BP_SHOP="https://www.etsy.com/shop/TrueHavenStudios";window.BP_VERSION="1.0.0";</script>
@@ -401,7 +404,7 @@ const E = (() => {
       return out;
     }
     const step = STEPM[f] || 1;
-    const day = pd(it.start).getDate();
+    const day = +it.day || pd(it.start).getDate();
     const sm = pd(it.start), fm = pd(from);
     let k = Math.max(0, Math.floor(((fm.getFullYear() - sm.getFullYear()) * 12 + fm.getMonth() - sm.getMonth()) / step) - 1);
     for (let s = addMonths(it.start, k * step, day); s <= end; k++, s = addMonths(it.start, k * step, day)) push(s);
@@ -410,13 +413,57 @@ const E = (() => {
   const PER_MONTH = { weekly: 52 / 12, biweekly: 26 / 12, "4weekly": 13 / 12, semimonthly: 2, monthly: 1, quarterly: 1 / 3, halfyearly: 1 / 6, yearly: 1 / 12, once: 0 };
   const perMonth = it => (PER_MONTH[it.freq || "monthly"] || 0) * (+it.amount || 0);
   const OUTK = ["bill", "sub", "debt", "save"];
+  // a repeat still running on/after `today` (not switched off, not ended, has a date to come)
+  const active = (r, today) => !!r && !r.off && (!r.end || r.end >= today) && occ(r, today, addDays(today, 800)).length > 0;
+  // end of a calendar day as a timestamp (for balance checks saved before timestamps existed)
+  const dayEndTs = s => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d, 23, 59, 59, 999).getTime(); };
+
+  // ------------------------------------------------------------ "counts exactly once"
+  // A goal, debt or account has a base value typed on day asOf at moment asTs. Anything that happened by then is in the base.
+  // A repeat date counts once it's due (date <= today) or once it's ticked as paid – unless it was already in the base:
+  // dated before asOf, dated on asOf by a repeat that existed at asTs, or ticked before asTs.
+  const tickTs = o => { const p = ((o.r && o.r.paid) || {})[o.date]; return typeof p === "number" && p > 1 ? p : 0; };
+  // goals (b.edited defined): on the day a goal is first created its typed amount never includes that day's transfer,
+  // so a same-day transfer counts – also for repeats made before timestamps existed. After an edit it's in the base if the repeat existed then.
+  const occInBase = (b, o) => {
+    const tk = tickTs(o);
+    if (o.date < b.asOf) return true;
+    if (o.date === b.asOf && b.edited !== false && !((+o.r.ts || 0) > b.asTs)) return true;   // was due when the base was typed
+    return tk > 0 && tk <= b.asTs;                                                                // ticked before the base was typed
+  };
+  const occCounts = (b, o, today) => (o.date <= today || tickTs(o) > 0) && !occInBase(b, o);
+  // hand-made entries ("Add money", "Log a payment") count on their date; entries made before asTs and dated by asOf are in the base
+  const histInBase = (b, h) => h.date <= b.asOf && !((+h.ts || 0) > b.asTs);
+  const histCounts = (b, h, today) => h.date <= today && !histInBase(b, h);
+  const gBase = (g, today) => { const asOf = g.asOf || g.created || today; return { asOf, asTs: +g.asTs || 0, edited: g.edited !== undefined ? !!g.edited : !!(g.created && g.created !== asOf) }; };
+  const dBase = (d, today) => ({ asOf: d.asOf || today, asTs: +d.asTs || 0 });
+  // debt payments stop at zero: the last one is only what's left. returns {"repeatId|date": amount} for dates after the base
+  function debtCaps(st, d, to) {
+    const b = dBase(d, to), ev = [], cap = {};
+    (st.rec || []).forEach(r => {
+      if (r.off || r.kind !== "debt" || r.debt !== d.id) return;
+      occ(r, b.asOf, to).forEach(date => { if (!(r.skip || {})[date] && !occInBase(b, { r, date })) ev.push({ date, amount: +r.amount || 0, key: r.id + "|" + date }); });
+    });
+    (d.history || []).forEach(h => { if (!h.rec && !histInBase(b, h)) ev.push({ date: h.date, amount: +h.amount || 0 }); });
+    ev.sort((x, y) => x.date < y.date ? -1 : x.date > y.date ? 1 : (x.key ? 1 : 0) - (y.key ? 1 : 0));
+    let rem = Math.max(0, +d.balance || 0);
+    ev.forEach(e => { const v = Math.max(0, Math.min(e.amount, rem)); rem -= v; if (e.key) cap[e.key] = r2(v); });
+    return cap;
+  }
 
   // every recurring date between from..to (skipped ones left out). kinds: optional filter
   function recOcc(st, from, to, kinds) {
-    const res = [];
+    const res = [], caps = {};
     (st.rec || []).forEach(r => {
       if (r.off || (kinds && !kinds.includes(r.kind))) return;
-      occ(r, from, to).forEach(date => { if (!(r.skip || {})[date]) res.push({ r, date, amount: +r.amount || 0, kind: r.kind }); });
+      const d = r.kind === "debt" && r.debt ? (st.debts || []).find(x => x.id === r.debt) : null;
+      const cap = d ? (caps[d.id] = caps[d.id] || debtCaps(st, d, to)) : null;
+      occ(r, from, to).forEach(date => {
+        if ((r.skip || {})[date]) return;
+        let amount = +r.amount || 0;
+        if (cap && (r.id + "|" + date) in cap) { amount = cap[r.id + "|" + date]; if (amount <= 0.004) return; } // debt already paid off
+        res.push({ r, date, amount, kind: r.kind });
+      });
     });
     return res.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : b.amount - a.amount);
   }
@@ -455,7 +502,7 @@ const E = (() => {
     // safe to spend today (only in the current month)
     let safe = null;
     if (today >= from && today <= to) {
-      const spentBefore = sum(tOut.filter(t => t.date < today), t => t.amount);
+      const spentBefore = sum(tOut.filter(t => t.date !== today), t => t.amount); // everything logged this month except today (also dates still to come)
       const spentToday = sum(tOut.filter(t => t.date === today), t => t.amount);
       const left = incomePlan - bills - debtPay - saved - spentBefore;
       const daysLeft = diff(today, to) + 1;
@@ -471,48 +518,74 @@ const E = (() => {
   function paychecks(st, from, to) {
     const pays = recOcc(st, addDays(from, -62), addDays(to, 62), ["income"]);
     const extra = txs(st, addDays(from, -62), addDays(to, 62), "in").filter(t => t.paycheck).map(t => ({ date: t.date, amount: +t.amount, r: { name: t.note || "Pay" }, tx: t }));
-    const all = [...pays, ...extra].sort((a, b) => a.date < b.date ? -1 : 1);
+    const all = [...pays, ...extra].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+    // pay that lands on the same day is one paycheck – so its bills are only counted once
+    const days = [];
+    all.forEach(p => { const l = days[days.length - 1]; if (l && l.date === p.date) { l.amount += p.amount; l.names.push(p.r.name); } else days.push({ date: p.date, amount: p.amount, names: [p.r.name] }); });
     const res = [];
-    all.forEach((p, i) => {
+    days.forEach((p, i) => {
       if (p.date < from || p.date > to) return;
-      const next = all.slice(i + 1).find(q => q.date > p.date);
+      const next = days[i + 1];
       const end = next ? addDays(next.date, -1) : addDays(p.date, 30);
       const items = recOcc(st, p.date, end, OUTK);
       const out = sum(items, o => o.amount);
-      res.push({ date: p.date, end, amount: p.amount, name: p.r.name, items, out, left: p.amount - out, days: diff(p.date, end) + 1 });
+      res.push({ date: p.date, end, amount: p.amount, name: p.names.join(" + "), items, out, left: p.amount - out, days: diff(p.date, end) + 1 });
     });
     return res;
   }
 
   // ------------------------------------------------------------ balances
   const everyday = st => (st.accounts || []).filter(a => a.type === "everyday" || a.type === "cash");
-  // money in everyday accounts today: last balance check + everything that happened since
-  function balanceNow(st, today) {
-    const acc = everyday(st);
-    if (!acc.length) return 0;
-    const since = acc.reduce((m, a) => a.date && a.date < m ? a.date : m, today);
-    let bal = sum(acc, a => a.amount);
-    const R = recOcc(st, addDays(since, 1), today);
-    R.forEach(o => { bal += o.kind === "income" ? o.amount : -o.amount; });
-    txs(st, addDays(since, 1), today).forEach(t => { bal += t.kind === "in" ? +t.amount : -t.amount; });
-    return bal;
+  // the account bills, pay and anything without an account go through
+  const primary = st => { const A = st.accounts || []; return A.find(a => a.type === "everyday") || A.find(a => a.type === "cash") || null; };
+  const acctTs = a => a.asTs != null && isFinite(+a.asTs) ? +a.asTs : a.date ? dayEndTs(a.date) : 0;
+  // a goal whose money stays in the everyday account (not "kept in its own account")
+  const staysHome = (st, r) => { const g = r.goal && (st.goals || []).find(x => x.id === r.goal); return !!g && !g.separate; };
+  // everything that moves money in one account between two dates. physical: money put by for goals that stay in the account isn't taken out
+  function acctEvents(st, a, from, to, physical) {
+    const A = st.accounts || [], P = primary(st), out = [], sg = a.type === "credit" ? -1 : 1;
+    (st.tx || []).forEach(t => {
+      if (t.date < from || t.date > to) return;
+      const id = A.some(x => x.id === t.acct) ? t.acct : P && P.id;
+      if (id === a.id) out.push({ date: t.date, ts: t.ts, v: sg * (t.kind === "in" ? +t.amount : -t.amount) });
+    });
+    if (!P || P.id !== a.id) return out;
+    recOcc(st, from, to).forEach(o => { if (!(physical && o.kind === "save" && staysHome(st, o.r))) out.push({ date: o.date, o, v: o.kind === "income" ? o.amount : -o.amount }); });
+    (st.goals || []).forEach(g => { if (g.separate) (g.history || []).forEach(h => { if (!h.rec && h.date >= from && h.date <= to) out.push({ date: h.date, ts: h.ts, v: -(+h.amount || 0) }); }); });
+    (st.debts || []).forEach(d => (d.history || []).forEach(h => { if (!h.rec && h.date >= from && h.date <= to) out.push({ date: h.date, ts: h.ts, v: -(+h.amount || 0) }); }));
+    return out;
   }
-  // typical everyday spending per day: last 60 days of logged spending, or the budgets if there isn't enough yet
+  // one account today: its last balance check + everything since (each account from its own date). credit cards: what's owed
+  function acctNow(st, a, today, physical) {
+    const base = a.type === "credit" ? Math.abs(+a.amount || 0) : +a.amount || 0;
+    const b = { asOf: a.date || today, asTs: acctTs(a) };
+    if (b.asOf > today) return base;
+    let v = base;
+    acctEvents(st, a, b.asOf, addDays(today, 400), physical).forEach(e => {
+      if (e.o) { if (occCounts(b, e.o, today)) v += e.v; }           // a bill ticked as paid early is gone already
+      else if (e.date <= today && (e.date > b.asOf || (+e.ts || 0) > b.asTs)) v += e.v; // logged after the balance check
+    });
+    return v;
+  }
+  // money in everyday accounts today
+  const balanceNow = (st, today, physical) => sum(everyday(st), a => acctNow(st, a, today, physical));
+  // typical everyday spending per day, from what's been logged (nothing logged yet = 0, not a guess from budgets)
   function usualDaily(st, today) {
-    const first = (st.tx || []).filter(t => t.kind === "out").reduce((m, t) => t.date < m ? t.date : m, today);
+    const first = (st.tx || []).filter(t => t.kind === "out" && t.date < today).reduce((m, t) => t.date < m ? t.date : m, today);
     const span = Math.min(60, diff(first, today));
-    if (span >= 14) return sum(txs(st, addDays(today, -span), addDays(today, -1), "out"), t => t.amount) / span;
-    const billCats = new Set((st.rec || []).filter(r => r.kind === "bill" || r.kind === "sub").map(r => r.cat));
-    return sum((st.cats || []).filter(c => !billCats.has(c.id)), c => c.budget) / 30.4;
+    if (span <= 0) return 0;
+    return sum(txs(st, addDays(today, -span), addDays(today, -1), "out"), t => t.amount) / Math.max(span, 7);
   }
   function forecast(st, today, days = 60, whatIf = null, perDay = null) {
     const start = balanceNow(st, today), pd_ = perDay == null ? usualDaily(st, today) : perDay;
-    const R = recOcc(st, addDays(today, 1), addDays(today, days));
+    const to = addDays(today, days), R = recOcc(st, addDays(today, 1), to);
+    // what moves the everyday accounts on each day to come (a bill already ticked as paid has left)
+    const moves = everyday(st).flatMap(a => acctEvents(st, a, addDays(today, 1), to, false)).filter(e => !(e.o && tickTs(e.o) > 0));
     const pts = [{ date: today, bal: start, ev: [] }];
     let bal = start, low = { date: today, bal: start };
     for (let i = 1; i <= days; i++) {
       const d = addDays(today, i), ev = R.filter(o => o.date === d);
-      ev.forEach(o => { bal += o.kind === "income" ? o.amount : -o.amount; });
+      moves.forEach(e => { if (e.date === d) bal += e.v; });
       bal -= pd_;
       if (whatIf && whatIf.date === d) bal -= whatIf.amount;
       pts.push({ date: d, bal, ev });
@@ -528,36 +601,53 @@ const E = (() => {
     ms.forEach((m, i) => Object.entries(m.byCat).forEach(([c, v]) => { (cats[c] = cats[c] || Array(12).fill(0))[i] += v; }));
     return { y, ms, cats, income: sum(ms, m => m.incomePlan), out: sum(ms, m => m.out), saved: sum(ms, m => m.saved), spent: sum(ms, m => m.spent), bills: sum(ms, m => m.bills), debt: sum(ms, m => m.debtPay) };
   }
-  // costs that don't come every month in the next 12 months -> how much to put aside per month
+  // costs that don't come every month in the next 12 months -> how much to put aside per month (one transfer a month until the bill)
   function pots(st, today) {
-    const items = (st.rec || []).filter(r => !r.off && ["quarterly", "halfyearly", "yearly"].includes(r.freq) && r.kind !== "income");
-    const to = addDays(today, 365);
+    const items = (st.rec || []).filter(r => active(r, today) && ["quarterly", "halfyearly", "yearly"].includes(r.freq) && r.kind !== "income");
+    const to = addDays(today, 365), start = addDays(today, 1);
     return items.map(r => {
-      const next = occ(r, addDays(today, 1), to).find(d => !(r.skip || {})[d]);
-      const months = next ? Math.max(1, Math.ceil(diff(today, next) / 30.44)) : 12;
+      const next = occ(r, start, to).find(d => !(r.skip || {})[d]);
+      const n = next ? occ({ start, freq: "monthly" }, start, addDays(next, -1)).length : 12;
       const g = (st.goals || []).find(x => x.pot === r.id);
       const have = g ? goalSaved(st, g, today) : 0;
-      return { r, next, months, aside: Math.max(0, (+r.amount - have)) / months, steady: perMonth(r), have, goal: g };
-    }).sort((a, b) => (a.next || "9") < (b.next || "9") ? -1 : 1);
+      const saving = !!g && (st.rec || []).some(x => x.kind === "save" && x.goal === g.id && active(x, start));
+      return { r, next, months: Math.max(1, n), transfers: n, aside: Math.max(0, (+r.amount - have)) / Math.max(1, n), steady: perMonth(r), have, goal: g, saving };
+    }).filter(p => p.next).sort((a, b) => a.next < b.next ? -1 : 1);
   }
 
-  // ------------------------------------------------------------ goals & debt (base value + what happened since)
+  // ------------------------------------------------------------ goals & debt (base value + what happened since, each thing exactly once)
+  const goalOccCounts = (g, o, today) => occCounts(gBase(g, today), o, today);
   function goalSaved(st, g, today) {
-    const recAdds = recOcc(st, addDays(g.asOf || g.created || today, 1), today, ["save"]).filter(o => o.r.goal === g.id);
-    return (+g.saved || 0) + sum(recAdds, o => o.amount) + sum((g.history || []).filter(h => !h.rec && (h.date > (g.asOf || "0") || (h.date === g.asOf && (h.ts || 0) > (g.asTs || 0)))), h => h.amount);
+    const b = gBase(g, today), ev = [];
+    recOcc(st, b.asOf, addDays(today, 400), ["save"]).forEach(o => { if (o.r.goal === g.id && occCounts(b, o, today)) ev.push([o.date, o.amount]); });
+    (g.history || []).forEach(h => { if (!h.rec && histCounts(b, h, today)) ev.push([h.date, +h.amount || 0]); });
+    if (!g.pot) return (+g.saved || 0) + sum(ev, e => e[1]);
+    // a pot for a big bill: the bill is paid out of it when it's due (or ticked), and a pot never goes below zero
+    (st.rec || []).filter(r => r.id === g.pot).forEach(r => occ(r, b.asOf, addDays(today, 400)).forEach(date => {
+      const o = { r, date }; if (!(r.skip || {})[date] && occCounts(b, o, today)) ev.push([date, -(+r.amount || 0)]);
+    }));
+    ev.sort((x, y) => x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : y[1] - x[1]);
+    return ev.reduce((v, e) => Math.max(0, v + e[1]), Math.max(0, +g.saved || 0));
   }
   function goalPace(st, g, today) {
-    const saved = goalSaved(st, g, today), left = Math.max(0, g.target - saved);
-    const recM = sum((st.rec || []).filter(r => !r.off && r.kind === "save" && r.goal === g.id), r => perMonth(r));
+    const saved = goalSaved(st, g, today), left = Math.max(0, g.target - saved), tmr = addDays(today, 1);
+    const recM = sum((st.rec || []).filter(r => r.kind === "save" && r.goal === g.id && active(r, tmr)), r => perMonth(r));
     const monthly = recM || +g.monthly || 0;
     const months = left <= 0 ? 0 : monthly > 0 ? Math.ceil(left / monthly) : Infinity;
     const need = g.by && left > 0 ? left / Math.max(1, Math.ceil(diff(today, g.by) / 30.44)) : null;
     return { saved, left, monthly, months, need, done: left <= 0, finish: months === Infinity ? null : addMonths(today, months), pct: g.target > 0 ? Math.min(1, saved / g.target) : 0 };
   }
   function debtBal(st, d, today) {
-    const recPays = recOcc(st, addDays(d.asOf || today, 1), today, ["debt"]).filter(o => o.r.debt === d.id);
-    const paid = sum(recPays, o => o.amount) + sum((d.history || []).filter(h => !h.rec && (h.date > (d.asOf || "0") || (h.date === d.asOf && (h.ts || 0) > (d.asTs || 0)))), h => h.amount);
+    const b = dBase(d, today);
+    const recPays = recOcc(st, b.asOf, addDays(today, 400), ["debt"]).filter(o => o.r.debt === d.id && occCounts(b, o, today));
+    const paid = sum(recPays, o => +o.r.amount || 0) + sum((d.history || []).filter(h => !h.rec && histCounts(b, h, today)), h => h.amount);
     return Math.max(0, (+d.balance || 0) - paid);
+  }
+  // a repeat that still matters for "a month" totals: running, and not paying a debt that's already gone
+  function live(st, r, today) {
+    if (!active(r, today)) return false;
+    const d = r.kind === "debt" && r.debt && (st.debts || []).find(x => x.id === r.debt);
+    return !d || debtBal(st, d, today) > 0.005;
   }
   function debtPlan(debts, extra, method) {
     let ds_ = debts.filter(d => d.bal > 0.005).map(d => ({ id: d.id, bal: +d.bal, apr: +d.apr || 0, min: +d.min || 0, ord: +d.order || 0 }));
@@ -582,15 +672,15 @@ const E = (() => {
   // ------------------------------------------------------------ net worth
   function netWorth(st, today) {
     const own = [], owe = [];
+    let homeGoals = 0;
     (st.accounts || []).forEach(a => {
-      const v = a.type === "everyday" || a.type === "cash" ? null : +a.amount;
-      if (a.type === "credit") owe.push({ name: a.name, v: Math.abs(+a.amount), src: "account", id: a.id });
-      else own.push({ name: a.name, v: v == null ? +a.amount : v, src: "account", id: a.id, type: a.type });
+      const v = acctNow(st, a, today, a.type === "everyday" || a.type === "cash" ? false : true);
+      if (a.type === "credit") owe.push({ name: a.name, v, src: "account", id: a.id });
+      else own.push({ name: a.name, v, src: "account", id: a.id, type: a.type });
+      // savings for goals that stay in the everyday account are still yours – shown as their own line
+      if (primary(st) && primary(st).id === a.id) homeGoals = acctNow(st, a, today, true) - v;
     });
-    const evBal = balanceNow(st, today), evBase = sum(everyday(st), a => a.amount);
-    // spread what happened since the balance checks over the everyday accounts (shown as one line)
-    const evRows = own.filter(x => x.type === "everyday" || x.type === "cash");
-    if (evRows.length) evRows[0].v += evBal - evBase;
+    if (homeGoals > 0.005) own.push({ name: "Put by for goals (still in your account)", v: homeGoals, src: "homegoals", id: "" });
     (st.debts || []).forEach(d => owe.push({ name: d.name, v: debtBal(st, d, today), src: "debt", id: d.id }));
     (st.assets || []).forEach(a => (a.kind === "owe" ? owe : own).push({ name: a.name, v: +a.value || 0, src: "asset", id: a.id, emoji: a.emoji }));
     (st.goals || []).filter(g => g.separate).forEach(g => own.push({ name: g.name, v: goalSaved(st, g, today), src: "goal", id: g.id }));
@@ -599,7 +689,7 @@ const E = (() => {
   }
 
   return { pad, ds, pd, addDays, diff, dim, ym, ymAdd, addMonths, monthStart, monthEnd, dow, r2, sum, occ, perMonth, recOcc, isPaid, txs, month, paychecks,
-    balanceNow, usualDaily, forecast, year, pots, goalSaved, goalPace, debtBal, debtPlan, netWorth, OUTK };
+    balanceNow, acctNow, primary, dayEndTs, usualDaily, forecast, year, pots, goalSaved, goalOccCounts, goalPace, debtBal, debtPlan, netWorth, active, live, OUTK };
 })();
 if (typeof module !== "undefined") module.exports = E;
 
@@ -702,7 +792,7 @@ function blank() {
     v: 1, setup: false, created: today(),
     settings: { name: "", currency: "USD", theme: "Blush", dark: "auto", weekStart: 1, nospendGoal: 10, split: [50, 30, 20], method: "avalanche", extra: 100, safetyMonths: 3, simple: true, hideStart: false },
     seen: {}, nothing: {},
-    accounts: [{ id: uid(), name: "Checking", type: "everyday", amount: 0, date: today() }],
+    accounts: [{ id: uid(), name: "Checking", type: "everyday", amount: 0, date: today(), asTs: 0 }],
     cats: DEFAULT_CATS.map(c => ({ ...c })), tx: [], rec: [], goals: [], debts: [], assets: [], nwHist: {}, rules: [], imports: [], lastBackup: ""
   };
 }
@@ -738,6 +828,13 @@ function migrate(s) {
   out.rec = out.rec.filter(r => okDate(r.start) && isFinite(+r.amount));
   out.goals = out.goals.filter(g => isFinite(+g.target));
   out.debts = out.debts.filter(d => isFinite(+d.balance));
+  // older backups: give every base value a date and a moment, so what happens after it counts exactly once
+  const t = today();
+  out.goals.forEach(g => { if (!okDate(g.asOf)) g.asOf = okDate(g.created) ? g.created : t; if (typeof g.asTs !== "number" || !isFinite(g.asTs)) g.asTs = 0; if (!Array.isArray(g.history)) g.history = []; });
+  out.debts.forEach(d => { if (!okDate(d.asOf)) d.asOf = t; if (typeof d.asTs !== "number" || !isFinite(d.asTs)) d.asTs = 0; if (!Array.isArray(d.history)) d.history = []; });
+  out.accounts.forEach(a => { if (!okDate(a.date)) a.date = t; if (typeof a.asTs !== "number" || !isFinite(a.asTs)) a.asTs = E.dayEndTs(a.date); });
+  // "Other" catches spending from deleted categories, so it's always there
+  if (!out.cats.some(c => c.id === "other")) out.cats.push({ ...DEFAULT_CATS.find(c => c.id === "other") });
   return out;
 }
 let saveT = null;
@@ -962,13 +1059,15 @@ function shell(content) {
     <button class="fab" data-act="add" aria-label="Add">${ic("plus")}</button>
     <a href="#/bills" class="${r === "bills" ? "on" : ""}">${ic("repeat")}Bills</a><button data-act="moreNav" class="${["home", "spending", "bills"].includes(r) ? "" : "on"}" style="${["home", "spending", "bills"].includes(r) ? "" : "color:var(--a)"}">${ic("more")}More</button></nav>`;
 }
-function cancelSoon() { const t = today(); return S.rec.filter(r => !r.off && r.cancelBy && r.cancelBy >= t && E.diff(t, r.cancelBy) <= 7); }
+function cancelSoon() { const t = today(); return S.rec.filter(r => r.cancelBy && r.cancelBy >= t && E.diff(t, r.cancelBy) <= 7 && E.active(r, t)); }
+// categories that hold a running bill or subscription (their budget is the bill, not everyday spending)
+function billCatSet(t) { return new Set(S.rec.filter(r => (r.kind === "bill" || r.kind === "sub") && E.active(r, t)).map(r => r.cat)); }
 
 // ------------------------------------------------------------ dashboard
 function vHome() {
   const t = today(), m = curMonth(), M = E.month(S, m, t), name = S.settings.name;
   const isNow = m === E.ym(t);
-  const billCats = new Set(S.rec.filter(r => r.kind === "bill" || r.kind === "sub").map(r => r.cat));
+  const billCats = billCatSet(t);
   const spendBudget = E.sum(S.cats.filter(c => !billCats.has(c.id)), c => c.budget);
   // hero
   let hero;
@@ -1052,7 +1151,7 @@ function nextStep(M) {
   const t = today(), soon = cancelSoon()[0];
   const loggedToday = S.tx.some(x => x.date === t), said = (S.nothing || {})[t];
   const dueSoon = E.recOcc(S, t, E.addDays(t, 1), ["bill", "sub", "debt"])[0];
-  const over = S.cats.filter(c => c.budget > 0 && (M.byCat[c.id] || 0) > c.budget && !S.rec.some(r => r.cat === c.id)).sort((a, b) => (M.byCat[b.id] - b.budget) - (M.byCat[a.id] - a.budget))[0];
+  const over = S.cats.filter(c => c.budget > 0 && (M.byCat[c.id] || 0) > c.budget && !billCatSet(t).has(c.id)).sort((a, b) => (M.byCat[b.id] - b.budget) - (M.byCat[a.id] - a.budget))[0];
   let ico = "✨", txt = "You're on track. Nothing needs you right now.", btns = "";
   if (soon) { ico = "⏰"; txt = `<b>${esc(soon.name)}</b> renews soon – cancel ${rel(soon.cancelBy) === "today" ? "today" : "by " + dshort(soon.cancelBy)} if you don't want it.`; btns = `<button class="btn sm" data-act="cancelled" data-id="${soon.id}">I cancelled it</button><button class="btn sm" data-act="editRec" data-id="${soon.id}">Keep it</button>`; }
   else if (!loggedToday && !said) { ico = "📝"; txt = "Spent anything today? Logging it keeps your number honest."; btns = `<button class="btn sm pri" data-act="add">${ic("plus")}Log a spend</button><button class="btn sm" data-act="nothingToday">Nothing today</button>`; }
@@ -1088,7 +1187,7 @@ function budRow(c, v, edit) {
 // ------------------------------------------------------------ spending & budget
 function vSpending() {
   const t = today(), m = curMonth(), M = E.month(S, m, t);
-  const billCats = new Set(S.rec.filter(r => r.kind === "bill" || r.kind === "sub").map(r => r.cat));
+  const billCats = billCatSet(t);
   const budgeted = E.sum(S.cats, c => c.budget);
   const everydayB = E.sum(S.cats.filter(c => !billCats.has(c.id)), c => c.budget);
   const daysLeft = m === E.ym(t) ? E.diff(t, M.to) + 1 : 0;
@@ -1126,7 +1225,7 @@ function vSpending() {
 // ------------------------------------------------------------ bills & income (everything that repeats)
 function vBills() {
   const t = today(), m = curMonth(), M = E.month(S, m, t);
-  const act = S.rec.filter(r => !r.off);
+  const act = S.rec.filter(r => E.live(S, r, t)); // ended, stopped, replaced or paid-off ones don't count any more
   const fixed = E.sum(act.filter(r => r.kind !== "income" && r.kind !== "save"), E.perMonth), subsY = E.sum(act.filter(r => r.kind === "sub"), E.perMonth) * 12, incM = E.sum(act.filter(r => r.kind === "income"), E.perMonth);
   const tiles = `<div class="tiles">${tile("Fixed costs a month", fmt0(fixed), "yearly & quarterly spread out")}${tile("Subscriptions a year", fmt0(subsY), `${act.filter(r => r.kind === "sub").length} subscriptions`)}${tile("Pay a month", fmt0(incM), `${pct(fixed, incM)} goes to fixed costs`)}</div>`;
   const K = VS.billKind, kinds = [["all", "All"], ["bill", "Bills"], ["sub", "Subscriptions"], ["debt", "Debt"], ["income", "Income"], ["save", "Savings"]];
@@ -1136,10 +1235,14 @@ function vBills() {
   const occs = M.rec.filter(filt);
   const thisM = card(`${MONTHS[+m.slice(5) - 1]} · ${occs.length} payments`, occs.length ? `<div class="list">${occs.map(o => {
     const done = o.date <= t, paid = o.kind !== "income" && E.isPaid(o);
-    return `<div class="item${paidCls(o)}">${tick(o)}${dateBox(o.date, o.kind === "income" ? "ok" : done || paid ? "" : "a")}<div class="grow click" data-act="editRec" data-id="${o.r.id}" style="cursor:pointer"><div class="nm">${esc(o.r.name)}</div><div class="tiny muted">${KIND[o.kind][0]} · ${paid ? "paid" : done ? (o.kind === "income" ? "came in" : "due " + rel(o.date)) : rel(o.date)}${o.r.cat ? " · " + esc(catOf(o.r.cat).name) : ""}</div></div><span class="amt ${o.kind === "income" ? "in" : ""}">${o.kind === "income" ? "+" : ""}${fmt(o.amount)}</span><button class="iconbtn" title="Skip this one" aria-label="Skip this one" data-act="skipOcc" data-id="${o.r.id}" data-d="${o.date}">${ic("x")}</button></div>`;
+    return `<div class="item${paidCls(o)}">${tick(o)}${dateBox(o.date, o.kind === "income" ? "ok" : done || paid ? "" : "a")}<div class="grow click" data-act="editRec" data-id="${o.r.id}" style="cursor:pointer"><div class="nm">${esc(o.r.name)}</div><div class="tiny muted">${KIND[o.kind][0]} · ${paid ? "paid" : done ? (o.kind === "income" ? "came in" : o.date === t ? "due today" : dshort(o.date) + " · not ticked") : rel(o.date)}${o.r.cat ? " · " + esc(catOf(o.r.cat).name) : ""}</div></div><span class="amt ${o.kind === "income" ? "in" : ""}">${o.kind === "income" ? "+" : ""}${fmt(o.amount)}</span><button class="iconbtn" title="Skip this one" aria-label="Skip this one" data-act="skipOcc" data-id="${o.r.id}" data-d="${o.date}">${ic("x")}</button></div>`;
   }).join("")}</div>` : `<div class="empty">Nothing in ${MONTHS[+m.slice(5) - 1]}.</div>`, { tight: true, right: `<span>${fmt(E.sum(occs.filter(o => o.kind !== "income"), o => o.amount))} out · ${fmt(E.sum(occs.filter(o => o.kind === "income"), o => o.amount))} in</span>` });
-  const all = act.filter(r => K === "all" || r.kind === K).map(r => ({ r, next: E.recOcc({ rec: [r] }, t, E.addDays(t, 400))[0] })).sort((a, b) => (a.next ? a.next.date : "9") < (b.next ? b.next.date : "9") ? -1 : 1);
-  const everything = card("Everything that repeats", all.length ? `<div class="list">${all.map(({ r, next }) => `<div class="item click" data-act="editRec" data-id="${r.id}"><div class="emo">${KIND[r.kind][1]}</div><div class="grow"><div class="nm">${esc(r.name)} ${r.priceFrom ? `<span class="badge warn">price up</span>` : ""}${r.cancelBy ? `<span class="badge">cancel by ${dshort(r.cancelBy)}</span>` : ""}</div><div class="tiny muted">${FREQ[r.freq]}${next ? " · next " + dshort(next.date) : " · ended"}</div></div><span class="amt ${r.kind === "income" ? "in" : ""}">${r.kind === "income" ? "+" : ""}${fmt(r.amount)}</span></div>`).join("")}</div>` : `<div class="empty">Add your pay, rent, phone and subscriptions once – they count by themselves on their dates.</div>`, { b: true, tight: true });
+  const withNext = S.rec.filter(r => K === "all" || r.kind === K).map(r => ({ r, next: act.includes(r) ? E.recOcc({ ...S, rec: [r] }, t, E.addDays(t, 400))[0] : null }));
+  const all = withNext.filter(x => x.next).sort((a, b) => a.next.date < b.next.date ? -1 : a.next.date > b.next.date ? 1 : 0);
+  const ended = withNext.filter(x => !x.next).sort((a, b) => (b.r.end || b.r.start) < (a.r.end || a.r.start) ? -1 : 1);
+  const recRow = ({ r, next }) => `<div class="item click" data-act="editRec" data-id="${r.id}"><div class="emo">${KIND[r.kind][1]}</div><div class="grow"><div class="nm">${esc(r.name)} ${r.priceFrom && next ? `<span class="badge warn">price up</span>` : ""}${r.cancelBy && r.cancelBy >= t && next ? `<span class="badge">cancel by ${dshort(r.cancelBy)}</span>` : ""}</div><div class="tiny muted">${FREQ[r.freq]}${next ? " · next " + dshort(next.date) : r.freq === "once" ? " · " + dshort(r.start) : r.end ? " · ended " + dshort(r.end) : " · ended"}</div></div><span class="amt ${r.kind === "income" ? "in" : ""}">${r.kind === "income" ? "+" : ""}${fmt(r.amount)}</span></div>`;
+  const endedL = ended.length ? `<details class="ended"><summary class="tiny muted">Ended or done · ${ended.length}</summary><div class="list">${ended.map(recRow).join("")}</div></details>` : "";
+  const everything = card("Everything that repeats", all.length || ended.length ? `${all.length ? `<div class="list">${all.map(recRow).join("")}</div>` : `<div class="empty">Nothing running right now.</div>`}${endedL}` : `<div class="empty">Add your pay, rent, phone and subscriptions once – they count by themselves on their dates.</div>`, { b: true, tight: true });
   return head("Bills, subscriptions & pay", "Bills & income", `${monthPick()}${addBtn("Add a repeat", "newRec")}`, "Set it once – everything here counts by itself on its date.") + tiles + warn +
     `<div class="row wrap mt"><div class="seg">${kinds.map(([v, l]) => `<button class="${K === v ? "on" : ""}" data-act="billKind" data-v="${v}">${l} <span class="faint">${v === "all" ? act.length : act.filter(r => r.kind === v).length}</span></button>`).join("")}</div></div>
     <div class="grid g2 mt">${thisM}${everything}</div>`;
@@ -1208,7 +1311,7 @@ function vForecast() {
   return head(`The next ${N} days`, "Look ahead", `<div class="seg">${[30, 60, 90].map(d => `<button class="${N === d ? "on" : ""}" data-act="fdays" data-v="${d}">${d} days</button>`).join("")}</div>`, "Your everyday balance, day by day – bills and paydays land on their dates.") +
     `<div class="tiles">${tile("Now", fmt0(F.start), `in your everyday accounts${E.diff(oldest, t) > 7 ? ` · <button class="link" data-go="settings">checked ${E.diff(oldest, t)} days ago</button>` : ""}`)}${tile("Lowest point", fmt0(F.low.bal), `on ${dshort(F.low.date)}`, F.low.bal < 0 ? "bad" : "")}${tile(`In ${N} days`, "about " + fmt0(F.end), `on ${dshort(E.addDays(t, N))}`)}</div>` +
     card("Your balance, day by day", chart + `<div class="hleg"><span><i style="background:var(--ok)"></i>pay</span><span><i style="background:var(--a)"></i>bill / subscription</span><span><i style="background:var(--bad)"></i>debt payment</span><span><i style="background:var(--b)"></i>savings</span>${base ? `<span><i style="background:none;border-top:2px dashed var(--ink3);height:0;width:14px;border-radius:0"></i>without the purchase</span>` : ""}</div>
-      <p class="tiny muted">Assumes you spend about ${fmt(F.perDay)} a day (your usual from what you've logged) on top of the bills and pay on their dates.</p>
+      <p class="tiny muted">${F.perDay > 0 ? `Assumes you spend about ${fmt(F.perDay)} a day (your usual from what you've logged) on top of the bills and pay on their dates.` : "Only your bills, pay and what you've logged are in here – everyday spending is added once you've logged a few days of it."}</p>
       <div class="card pad" style="background:var(--bg2);box-shadow:none;margin-top:12px"><div class="row sb wrap"><b>What if I buy something?</b><span class="small">${wi ? verdict : "Slide to try a purchase."}</span></div>
       <div class="row" style="margin-top:10px"><span class="small" style="width:76px">How much</span><input type="range" id="wiA" min="0" max="2000" step="10" value="${VS.wi}"><b class="num" style="width:80px;text-align:right">${fmt0(VS.wi)}</b></div>
       <div class="row"><span class="small" style="width:76px">When</span><input type="range" id="wiD" min="1" max="${N}" step="1" value="${clamp(VS.wiDay, 1, N)}"><b class="num" style="width:80px;text-align:right">${dshort(E.addDays(t, clamp(VS.wiDay, 1, N)))}</b></div></div>`, { cls: "mt" }) +
@@ -1225,7 +1328,7 @@ function vYear() {
   const catRows = S.cats.filter(c => Y.cats[c.id]).map(c => `<tr><td>${esc(c.emoji)} ${esc(c.name)}</td>${Y.cats[c.id].map((v, i) => `<td class="${c.budget && v > c.budget ? "over" : ""} ${i === cm ? "cur" : ""}">${v ? fmt0(v) : "–"}</td>`).join("")}<td><b>${fmt0(E.sum(Y.cats[c.id]))}</b></td></tr>`).join("");
   const heat = `<div class="scrollx"><table class="t"><tr><th>Category</th>${MON.map(x => `<th>${x}</th>`).join("")}<th>Year</th></tr>${catRows || `<tr><td colspan="14">Nothing yet.</td></tr>`}</table></div><p class="tiny faint">Red = over that category's monthly budget.</p>`;
   const P = E.pots(S, t), potsAside = E.sum(P, p => p.aside);
-  const pots = P.length ? `<div class="list">${P.map(p => `<div class="item"><div class="emo">${KIND[p.r.kind][1]}</div><div class="grow"><div class="nm">${esc(p.r.name)}</div><div class="tiny muted">${fmt(p.r.amount)} ${FREQ[p.r.freq]} · next ${p.next ? dshort(p.next) : "–"}${p.goal ? ` · ${fmt0(p.have)} in its pot` : ""}</div></div><div style="text-align:right"><div class="amt">${fmt(p.aside)}</div><div class="tiny muted">a month</div></div>${p.goal ? "" : `<button class="btn sm" data-act="makePot" data-id="${p.r.id}">Save up for it</button>`}</div>`).join("")}</div>` : `<div class="empty">No yearly or quarterly costs yet – add insurance, car registration or yearly subscriptions in Bills & income.</div>`;
+  const pots = P.length ? `<div class="list">${P.map(p => `<div class="item"><div class="emo">${KIND[p.r.kind][1]}</div><div class="grow"><div class="nm">${esc(p.r.name)}</div><div class="tiny muted">${fmt(p.r.amount)} ${FREQ[p.r.freq]} · next ${p.next ? dshort(p.next) : "–"}${p.goal ? ` · ${fmt0(p.have)} in its pot` : ""}</div></div><div style="text-align:right"><div class="amt">${fmt(p.aside)}</div><div class="tiny muted">a month</div></div>${p.saving || !(p.aside > 0) ? "" : `<button class="btn sm" data-act="makePot" data-id="${p.r.id}">${p.goal ? "Save up again" : "Save up for it"}</button>`}</div>`).join("")}</div>` : `<div class="empty">No yearly or quarterly costs yet – add insurance, car registration or yearly subscriptions in Bills & income.</div>`;
   return head("Plan the year", String(y), `<div class="monthpick"><button class="iconbtn" data-act="yPrev" aria-label="Previous year">${ic("left")}</button><b>${y}</b><button class="iconbtn" data-act="yNext" aria-label="Next year">${ic("right")}</button></div>`, "Every month at a glance – and the big yearly bills, spread out.") +
     `<div class="tiles">${tile("Income", fmt0(Y.income), "whole year, planned")}${tile("Going out", fmt0(Y.out), "bills, spending, savings & debt")}${tile("Saved", fmt0(Y.saved), `savings rate ${pct(Y.saved, Y.income)}`, "ok")}</div>` +
     `<div class="grid g21 mt">${card("Income vs going out", chart + `<div class="hleg"><span><i style="background:var(--b)"></i>income</span><span><i style="background:var(--a)"></i>going out</span></div>`)}${card(`Costs that don't come monthly · ${fmt0(potsAside)}/mo`, pots, { b: true, tight: true })}</div>` +
@@ -1250,6 +1353,8 @@ function vGoals() {
   const gcards = paces.map(({ g, p }, i) => `<section class="card goal"><div class="band ${i % 2 ? "b" : ""}"><span class="t">${esc(g.emoji || "🎯")} ${esc(g.name)}</span><span class="r"><button class="lnk" data-act="editGoal" data-id="${g.id}">Edit</button></span></div><div class="body">
     <div class="row">${jar(p.pct, i % 2 ? "var(--b)" : "var(--a)")}<div class="grow"><span class="bigsum num">${fmt0(p.saved)}</span> <span class="muted small">of ${fmt0(g.target)} · ${pct(p.saved, g.target)}</span>${bar(p.pct, i % 2 ? "" : "a")}</div></div>
     <div class="row sb" style="background:var(--bg2);border-radius:12px;padding:10px 14px;margin-top:12px"><span class="small">${p.done ? "Reached" : "At this pace"}</span><span class="serif" style="font-size:1.25em">${p.done ? "🎉 Done" : p.finish ? mname(E.ym(p.finish)) : "–"}</span><span class="tiny muted">${p.done ? "" : p.monthly ? `${fmt0(p.monthly)} a month` : "add a monthly amount"}</span></div>
+    ${(() => { const nx = p.done ? null : E.recOcc(S, t, E.addDays(t, 400), ["save"]).find(o => o.r.goal === g.id && o.date > t && !E.isPaid(o)); return nx ? `<div class="tiny muted" style="margin-top:6px">Next transfer: <b>+${fmt(nx.amount)}</b> on ${dshort(nx.date)} – it's added on that day, or tick it as paid in Bills & income when you move the money.</div>` : ""; })()}
+    ${p.done && goalRecs(g, t).length ? `<div class="row wrap" style="margin-top:8px;gap:8px"><span class="tiny muted grow">The monthly transfer is still running.</span><button class="btn sm" data-act="stopGoalRec" data-id="${g.id}">Stop the transfer</button></div>` : ""}
     ${g.by && !p.done ? `<div class="tiny muted" style="margin-top:6px">To make it by ${mname(E.ym(g.by))}, put by about ${fmt0(p.need)} a month.</div>` : ""}
     <div class="row wrap" style="margin-top:12px"><button class="btn sm pri" data-act="goalAdd" data-id="${g.id}">${ic("plus")}Add money</button><button class="btn sm" data-act="goalTake" data-id="${g.id}">Take some out</button>${p.monthly && !S.rec.some(r => r.goal === g.id) ? "" : ""}</div></div></section>`).join("");
   const pots = Pt.length ? card("Pots for big bills", `<div class="list">${Pt.map(g => { const p = E.goalPace(S, g, t); return `<div class="item click" data-act="editGoal" data-id="${g.id}">${jar(p.pct)}<div class="grow"><div class="nm">${esc(g.name)}</div>${bar(p.pct)}<div class="tiny muted" style="margin-top:3px">${fmt0(p.saved)} of ${fmt0(g.target)}${p.monthly ? ` · ${fmt0(p.monthly)} a month` : ""}</div></div></div>`; }).join("")}</div>`, { b: true, tight: true, cls: "mt" }) : "";
@@ -1262,10 +1367,10 @@ function vGoals() {
 function vDebt() {
   const t = today(), st = S.settings;
   if (!S.debts.length) return head("Paying it off", "Debt payoff", addBtn("Add a debt", "newDebt")) + `<div class="empty">Add your cards and loans – you'll see your debt-free date and the fastest order to pay them.</div>`;
-  const D = S.debts.map(d => ({ ...d, bal: E.debtBal(S, d, t) }));
+  const D = S.debts.map(d => ({ ...d, bal: E.debtBal(S, d, t) })), done = D.filter(d => d.bal <= 0.005);
   const plan = m => E.debtPlan(D, st.extra, m), P = plan(st.method), P0 = E.debtPlan(D, 0, st.method);
-  const total = E.sum(D, d => d.bal), mins = E.sum(D, d => d.min);
-  const fin = P.months === Infinity ? null : E.addMonths(t, P.months);
+  const total = E.sum(D, d => d.bal), mins = E.sum(D.filter(d => d.bal > 0.005), d => d.min);
+  const fin = P.months === Infinity ? null : E.addMonths(t, P.months), free = total <= 0.005;
   const sooner = P0.months === Infinity || P.months === Infinity ? null : P0.months - P.months, saved = P0.interest - P.interest;
   const n = Math.max(P.path.length, Math.min(P0.path.length, 360));
   const v1 = Array.from({ length: n }, (_, i) => P.path[i] ?? 0), v0 = Array.from({ length: n }, (_, i) => P0.path[Math.min(i, P0.path.length - 1)] ?? 0);
@@ -1274,11 +1379,12 @@ function vDebt() {
   const comp = methods.map(([k, l, s]) => { const q = plan(k); return `<button class="card pad" data-act="method" data-v="${k}" style="text-align:left;cursor:pointer;${st.method === k ? "border:2px solid var(--a)" : ""}"><div class="row sb"><b>${l}</b>${st.method === k ? '<span class="badge">your plan</span>' : ""}</div><div class="serif" style="font-size:1.35em;margin-top:4px">${q.months === Infinity ? "never" : mname(E.ym(E.addMonths(t, q.months)))}</div><div class="tiny muted">${s} · ${q.interest === Infinity ? "–" : fmt0(q.interest)} interest</div></button>`; }).join("");
   const rows = P.order.map((id, i) => { const d = D.find(x => x.id === id); return `<div class="item click" data-act="editDebt" data-id="${d.id}"><div class="emo">${i + 1}</div><div class="grow"><div class="nm">${esc(d.name)}</div><div class="tiny muted">${(+d.apr || 0).toFixed(2)}% · min ${fmt0(d.min)}${d.dueDay ? ` on the ${d.dueDay}${["th", "st", "nd", "rd"][(d.dueDay % 10 < 4 && Math.floor(d.dueDay / 10) !== 1) ? d.dueDay % 10 : 0]}` : ""} · gone ${P.payoff[d.id] ? mshort(E.ym(E.addMonths(t, P.payoff[d.id]))) : "–"}</div></div><div style="text-align:right"><div class="amt">${fmt(d.bal)}</div><button class="link tiny" data-act="debtPay" data-id="${d.id}">Log a payment</button></div></div>`; }).join("");
   return head("Paying it off", "Debt payoff", addBtn("Add a debt", "newDebt"), "Your debt-free date – and the fastest way to get there.") +
-    `<div class="grid g12"><div class="hero"><div class="band">Debt-free</div><div class="in"><div class="bigdate">${fin ? mname(E.ym(fin)) : "Not yet"}</div><div class="muted small" style="margin-top:4px">${fin ? `in ${P.months} months · ${fmt0(total)} to go` : "the payments don't cover the interest – add a little extra"}</div>
+    `<div class="grid g12"><div class="hero"><div class="band">Debt-free</div><div class="in"><div class="bigdate">${free ? "Now 🎉" : fin ? mname(E.ym(fin)) : "Not yet"}</div><div class="muted small" style="margin-top:4px">${free ? "everything is paid off" : fin ? `in ${P.months} month${P.months === 1 ? "" : "s"} · ${fmt0(total)} to go` : "the payments don't cover the interest – add a little extra"}</div>
       <div style="width:100%;max-width:360px;margin-top:16px"><div class="row sb small"><span>Extra each month</span><b class="serif" style="font-size:1.3em">${fmt0(st.extra)}</b></div><input type="range" id="extra" min="0" max="${Math.max(500, Math.ceil(mins / 100) * 100)}" step="10" value="${st.extra}"></div>
       <div class="row wrap" style="justify-content:center;gap:6px;margin-top:8px">${sooner > 0 ? `<span class="badge ok">${sooner} months sooner than minimums only</span>` : ""}${saved > 1 && isFinite(saved) ? `<span class="badge">${fmt0(saved)} less interest</span>` : ""}</div></div></div>
       ${card("Balance over time", chart + `<div class="hleg"><span><i style="background:var(--a)"></i>with your plan</span><span><i style="background:none;border-top:2px dashed var(--ink3);height:0;width:14px;border-radius:0"></i>minimums only</span></div>`, { b: true })}</div>
-    <div class="grid g3 mt">${comp}</div>` + card(`Your order · ${fmt0(total)} owed · ${fmt0(mins)} minimums`, `<div class="list">${rows}</div><p class="tiny faint">Balances are what you entered, less the payments since. Update them from your statement now and then. The date is an estimate that adds interest each month.</p>`, { cls: "mt", tight: true });
+    <div class="grid g3 mt">${comp}</div>` + (rows ? card(`Your order · ${fmt0(total)} owed · ${fmt0(mins)} minimums`, `<div class="list">${rows}</div><p class="tiny faint">Balances are what you entered, less the payments since. Update them from your statement now and then. The date is an estimate that adds interest each month.</p>`, { cls: "mt", tight: true }) : "") +
+    (done.length ? card("Paid off 🎉", `<div class="list">${done.map(d => `<div class="item click" data-act="editDebt" data-id="${d.id}"><div class="emo">🕊️</div><div class="grow"><div class="nm">${esc(d.name)}</div><div class="tiny muted">nothing left to pay · tap to edit or delete</div></div><span class="amt okc">${fmt(0)}</span></div>`).join("")}</div>`, { cls: "mt", tight: true, b: true }) : "");
 }
 
 // ------------------------------------------------------------ net worth
@@ -1294,7 +1400,7 @@ function vWorth() {
   const first = hist[0], prev = hist.length > 1 ? hist[hist.length - 2] : null, ch = prev ? W.net - prev.v : 0;
   const vals = hist.map(h => h.v);
   const chart = hist.length > 1 ? lineChart(vals, { h: 200, color: "var(--b)", zero: false, dots: vals.map((_, i) => [i, "var(--b)", `${mshort(hist[i].k)} · ${fmt0(vals[i])}`]), labels: [[0, mshort(first.k)], [vals.length - 1, mshort(hist[hist.length - 1].k)]], label: "Net worth over time" }) : `<div class="empty">Your line starts here – it grows month by month as you come back.</div>`;
-  const row = x => `<div class="item click" data-act="${x.src === "asset" ? "editAsset" : x.src === "debt" ? "editDebt" : x.src === "goal" ? "editGoal" : "editAcct"}" data-id="${x.id}"><div class="emo">${x.emoji || (x.src === "debt" ? "💳" : x.src === "goal" ? "🎯" : x.src === "account" ? "🏦" : "✨")}</div><div class="grow"><div class="nm">${esc(x.name)}</div><div class="tiny muted">${x.src === "account" ? "account · tap to update" : x.src === "debt" ? "debt · paid off on the Debt page" : x.src === "goal" ? "savings goal" : "tap to update"}</div></div><span class="amt">${fmt(x.v)}</span></div>`;
+  const row = x => `<div class="item click" ${x.src === "homegoals" ? `data-go="goals"` : `data-act="${x.src === "asset" ? "editAsset" : x.src === "debt" ? "editDebt" : x.src === "goal" ? "editGoal" : "editAcct"}" data-id="${x.id}"`}><div class="emo">${x.emoji || (x.src === "debt" ? "💳" : x.src === "goal" || x.src === "homegoals" ? "🎯" : x.src === "account" ? "🏦" : "✨")}</div><div class="grow"><div class="nm">${esc(x.name)}</div><div class="tiny muted">${x.src === "account" ? "account · tap to update" : x.src === "debt" ? "debt · paid off on the Debt page" : x.src === "goal" ? "savings goal" : x.src === "homegoals" ? "savings transfers to goals since your last balance check" : "tap to update"}</div></div><span class="amt">${fmt(x.v)}</span></div>`;
   return head("What you own and owe", "Net worth", `<button class="btn" data-act="newAsset" data-k="owe">${ic("plus")}Something you owe</button>${addBtn("Something you own", "newAsset")}`, "What you own minus what you owe.") +
     `<div class="grid g12"><div class="hero"><div class="band">Net worth</div><div class="in">${bigNum(W.net)}<div class="line">${prev ? `${ch >= 0 ? "▲" : "▼"} ${fmt0(Math.abs(ch))} since ${mshort(prev.k)}` : "your starting point"}</div>
       <div style="width:100%;max-width:340px;margin-top:14px"><div class="flow"><i style="flex:${Math.max(1, W.ownT)};background:var(--b)"></i><i style="flex:${Math.max(.0001, W.oweT)};background:var(--a2)"></i></div><div class="row sb tiny" style="margin-top:5px"><span>own ${fmt0(W.ownT)}</span><span>owe ${fmt0(W.oweT)}</span></div></div></div></div>
@@ -1324,7 +1430,7 @@ function vReview() {
   const sr = ms12.map(x => x.incomePlan ? Math.max(0, x.saved / x.incomePlan * 100) : 0);
   const checks = [
     ["Savings rate", pct(M.saved, inc), M.saved / (inc || 1) >= S.settings.split[2] / 100 ? "ok" : "", `target ${S.settings.split[2]}%`],
-    ["Spending vs budget", fmt0(M.spent), "", `budget ${fmt0(E.sum(S.cats.filter(c => !S.rec.some(r => (r.kind === "bill" || r.kind === "sub") && r.cat === c.id)), c => c.budget))}`],
+    ["Spending vs budget", fmt0(M.spent), "", `budget ${fmt0(E.sum(S.cats.filter(c => !billCatSet(t).has(c.id)), c => c.budget))}`],
     ["No-spend days", M.future ? "–" : String(M.noSpend), M.noSpend >= S.settings.nospendGoal ? "ok" : "", `goal ${S.settings.nospendGoal}`],
     ["Vs last month", (M.out <= L.out ? "▼ " : "▲ ") + fmt0(Math.abs(M.out - L.out)), M.out <= L.out ? "ok" : "bad", (M.out <= L.out ? "less" : "more") + (m === E.ym(t) ? " so far than all of " + MON[+L.m.slice(5) - 1] : " went out")]];
   // no-spend challenge: 12 mini calendars
@@ -1342,12 +1448,25 @@ function vReview() {
 }
 
 /* forms: add/edit spending, repeats, categories, goals, debts, assets, accounts, afford */
-const num = v => { if (v == null) return NaN; let s = String(v).trim().replace(/[^\d,.\-]/g, ""); if (/,\d{1,2}$/.test(s) && !/\.\d/.test(s)) s = s.replace(/\./g, "").replace(",", "."); else s = s.replace(/,/g, ""); return parseFloat(s); };
+// money typed any common way: 1234.56 · 1,234.56 · 1.234,56 · 1 234,56 · 1'234.50 · 12,50
+const num = v => {
+  if (v == null) return NaN; if (typeof v === "number") return v;
+  let s = String(v).trim().replace(/[\s  '’`]/g, "");
+  const neg = /^[-−]/.test(s) || /^\(.*\)$/.test(s);
+  s = s.replace(/[^\d,.]/g, ""); if (!/\d/.test(s)) return NaN;
+  const lc = s.lastIndexOf(","), ld = s.lastIndexOf(".");
+  // the last separator is the decimal point – unless it's the only one and has exactly 3 digits after it (1.234 / 1,234 = thousands)
+  let dec = Math.max(lc, ld);
+  if (dec >= 0 && (lc < 0 || ld < 0)) { const sep = s[dec], once = s.split(sep).length === 2; if (!once || (s.length - dec - 1 === 3 && /^[1-9]\d{0,2}$/.test(s.slice(0, dec)))) dec = -1; }
+  const int = (dec < 0 ? s : s.slice(0, dec)).replace(/[.,]/g, ""), fr = dec < 0 ? "" : s.slice(dec + 1).replace(/[.,]/g, "");
+  const r = parseFloat((int || "0") + (fr ? "." + fr : ""));
+  return neg ? -r : r;
+};
 const val = id => { const el = document.getElementById(id); return el ? el.value : ""; };
 const opt = (v, l, sel) => `<option value="${esc(v)}" ${String(v) === String(sel) ? "selected" : ""}>${esc(l)}</option>`;
 const field = (label, inner, help = "") => `<div class="field"><label>${label}</label>${inner}${help ? `<div class="help">${help}</div>` : ""}</div>`;
 const inp = (id, v = "", o = {}) => `<input class="inp" id="${id}" value="${esc(v)}" ${o.type ? `type="${o.type}"` : ""} ${o.ph ? `placeholder="${esc(o.ph)}"` : ""} ${o.num ? 'inputmode="decimal"' : ""} ${o.auto ? "autofocus" : ""} ${o.extra || ""}>`;
-const moneyInp = (id, v, o = {}) => inp(id, v === "" || v == null ? "" : String(E.r2(+v)), { ...o, num: true, ph: o.ph || "0.00" });
+const moneyInp = (id, v, o = {}) => { const n = num(v); return inp(id, v === "" || v == null ? "" : isFinite(n) ? String(E.r2(n)) : String(v), { ...o, num: true, ph: o.ph || "0.00" }); };
 function bad(msg) { toast(msg); return false; }
 
 // ------------------------------------------------------------ spending / money in
@@ -1361,7 +1480,7 @@ function txModal(x, date) {
     <div class="plus">${[1, 5, 10, 20].map(n => `<button data-act="txPlus" data-v="${n}">+${n}</button>`).join("")}<button data-act="txPlus" data-v="0" style="background:none">Clear</button></div>
     <div id="txCats" class="${TXK === "in" ? "hidden" : ""}"><div class="caps">What for</div><div class="cats">${S.cats.map(c => `<button class="cat ${c.id === TXCAT ? "on" : ""}" data-act="txCat" data-id="${c.id}">${esc(c.emoji)} ${esc(c.name)}</button>`).join("")}</div></div>
     <div class="frow">${field("Note (optional)", inp("txN", x.note, { ph: TXK === "in" ? "Birthday money, refund…" : "Lunch with Ana" }))}${field("Date", inp("txD", x.date, { type: "date" }))}</div>
-    <div class="frow">${accts.length > 1 ? field("Account", `<select class="inp" id="txAc">${accts.map(a => opt(a.id, a.name, x.acct || accts[0].id)).join("")}</select>`) : ""}${field("Tags (optional)", inp("txT", (x.tags || []).join(", "), { ph: "holiday, birthday" }))}</div>`;
+    <div class="frow">${accts.length > 1 ? field("Account", `<select class="inp" id="txAc">${accts.map(a => opt(a.id, a.name, x.acct || (E.primary(S) || accts[0]).id)).join("")}</select>`) : ""}${field("Tags (optional)", inp("txT", (x.tags || []).join(", "), { ph: "holiday, birthday" }))}</div>`;
   modal(isNew ? "Add" : "Edit", body, `${isNew ? "" : `<button class="btn danger" data-act="delTx" data-id="${x.id}">${ic("trash")}Delete</button>`}<button class="btn pri" data-act="saveTx" data-id="${isNew ? "" : x.id}">${isNew ? "Add it" : "Save"}</button>`);
   const a = $("#txA"); a && a.addEventListener("keydown", e => { if (e.key === "Enter") ACT.saveTx({ id: isNew ? "" : x.id }); });
 }
@@ -1369,7 +1488,7 @@ function saveTx(id) {
   const amount = num(val("txA"));
   if (!(amount > 0)) return bad("Type an amount first.");
   const date = val("txD") || today();
-  const data = { kind: TXK, amount: E.r2(amount), date, note: val("txN").trim(), cat: TXK === "out" ? TXCAT : null, acct: val("txAc") || (S.accounts[0] || {}).id, tags: val("txT").split(",").map(s => s.trim().replace(/^#/, "")).filter(Boolean) };
+  const data = { kind: TXK, amount: E.r2(amount), date, note: val("txN").trim(), cat: TXK === "out" ? TXCAT : null, acct: val("txAc") || (E.primary(S) || S.accounts[0] || {}).id, tags: val("txT").split(",").map(s => s.trim().replace(/^#/, "")).filter(Boolean) };
   commit(() => {
     if (id) { const x = S.tx.find(t => t.id === id); Object.assign(x, data); }
     else S.tx.push({ id: uid(), ts: now(), ...data });
@@ -1396,27 +1515,50 @@ function recModal(r, kind) {
   const sync = () => { const k = val("rK"); $("#rRowCat").style.display = k === "income" || k === "save" ? "none" : ""; $("#rRowGoal").style.display = k === "save" ? "" : "none"; $("#rRowDebt").style.display = k === "debt" ? "" : "none"; $("#rRowCancel").style.display = k === "sub" || k === "bill" ? "" : "none"; };
   $("#rK").addEventListener("change", sync); sync();
 }
+const MONTHLYF = ["monthly", "quarterly", "halfyearly", "yearly"];
+const pickDates = (o, keep) => Object.fromEntries(Object.entries(o || {}).filter(([d]) => keep(d)));
+// a repeat changes from `start` on: the old one keeps the dates before, a copy with the new details carries on (ticks and skips go with their dates)
+function splitRec(r, start, data) {
+  const nr = { ...r, ...data, id: uid(), start, skip: pickDates(r.skip, d => d >= start), paid: pickDates(r.paid, d => d >= start) };
+  if (!("end" in data)) nr.end = r.end || "";
+  r.skip = pickDates(r.skip, d => d < start); r.paid = pickDates(r.paid, d => d < start); r.end = E.addDays(start, -1);
+  S.rec.push(nr);
+  return nr;
+}
+// stop a repeat after today (today's date still counts); one that never started is removed
+function endRec(r, t) {
+  const end = E.occ(r, t, t).length ? t : E.addDays(t, -1);
+  if (!r.end || r.end > end) r.end = end;
+  if (r.end < r.start || !E.occ(r, r.start, r.end).length) S.rec = S.rec.filter(x => x !== r);
+}
+const dayOf = r => +r.day || E.pd(r.start).getDate();
 function saveRec(id) {
   const t = today(), name = val("rN").trim(), amount = num(val("rA")), start = val("rS");
   if (!name) return bad("Give it a name."); if (!(amount >= 0) || isNaN(amount)) return bad("Type the amount."); if (!start) return bad("Pick the next date.");
   const k = val("rK");
   const data = { name, amount: E.r2(amount), kind: k, freq: val("rF"), cat: k === "income" || k === "save" ? "" : val("rC"), end: val("rE") || "", goal: k === "save" ? val("rG") : "", debt: k === "debt" ? val("rD") : "", cancelBy: k === "sub" || k === "bill" ? val("rX") : "" };
   if (data.end && data.end < start) return bad("The end date is before the next date.");
+  let done = "Saved.";
   commit(() => {
-    if (!id) { S.rec.push({ id: uid(), start, added: t, skip: {}, ...data }); return; }
+    if (!id) { S.rec.push({ id: uid(), ts: now(), start, added: t, skip: {}, ...data }); return; }
     const r = S.rec.find(x => x.id === id);
-    const hadPast = r.start < t && E.recOcc({ rec: [r] }, r.start, E.addDays(t, -1)).length;
-    if (hadPast && (Math.abs(r.amount - data.amount) > .001 || r.freq !== data.freq || start !== (E.recOcc({ rec: [r] }, t, E.addDays(t, 400))[0] || {}).date)) {
-      // keep history: the old one stops before the new date, a copy carries on from there
-      const oldEnd = r.end; r.end = E.addDays(start < t ? t : start, -1);
-      if (r.end < r.start) r.end = r.start;
-      const nr = { ...r, ...data, id: uid(), start, skip: {}, paid: { ...(r.paid || {}) }, end: data.end || oldEnd || "" };
+    const shown = (E.recOcc({ rec: [r] }, t, E.addDays(t, 400))[0] || {}).date || r.start; // what the dialog showed as "Next date"
+    // monthly-type repeats keep their day of the month (a salary on the 31st stays on the 31st, also after February)
+    if (MONTHLYF.includes(data.freq)) { const d = start === shown && MONTHLYF.includes(r.freq) ? dayOf(r) : E.pd(start).getDate(); if (d !== E.pd(start).getDate() || r.day) data.day = d; }
+    else data.day = undefined;
+    if (data.goal !== (r.goal || "") || data.debt !== (r.debt || "")) data.ts = now(); // linked to another goal/debt: counts for it from now on
+    const future = r.freq !== "once" && !r.off && E.occ(r, t, E.addDays(t, 800)).length > 0;
+    const changed = Math.abs((+r.amount || 0) - data.amount) > .001 || r.freq !== data.freq || start !== shown;
+    const before = E.occ(r, r.start, E.addDays(start, -1)).length > 0; // dates already behind the new start
+    if (!future || !changed) Object.assign(r, data, { start: changed || !before ? start : r.start });  // one-time, ended, or just renamed: change in place
+    else if (start <= r.start || !before) Object.assign(r, data, { start });                         // moved before anything happened: replace
+    else {                                                                                            // keep the past, the new version carries on
+      const nr = splitRec(r, start, data);
       if (Math.abs(r.amount - data.amount) > .001 && (k === "sub" || k === "bill")) { nr.priceFrom = r.amount; nr.priceAt = t; }
-      S.rec.push(nr);
-      if (r.end < r.start) S.rec = S.rec.filter(x => x !== r);
-    } else Object.assign(r, data, { start: hadPast ? r.start : start });
+      done = `Saved – from ${dshort(start)} on. Earlier dates stay as they were.`;
+    }
   }, id ? "edit repeat" : "add repeat");
-  closeModal(); render(); toast(id ? "Saved." : `${esc(name)} added – it counts by itself on its dates.`);
+  closeModal(); render(); toast(id ? done : `${esc(name)} added – it counts by itself on its dates.`);
 }
 function delRecModal(id) {
   const r = S.rec.find(x => x.id === id), t = today(), past = r.start < t;
@@ -1429,7 +1571,7 @@ function catModal(c) {
   const isNew = !c; c = c || { name: "", emoji: "✨", group: "want", budget: 0 };
   modal(isNew ? "New category" : esc(c.name), `<div class="frow" style="grid-template-columns:80px 1fr">${field("Emoji", inp("cE", c.emoji))}${field("Name", inp("cN", c.name, { auto: true }))}</div>
     <div class="frow">${field("Monthly budget", moneyInp("cB", c.budget || ""))}${field("Kind", `<select class="inp" id="cG">${opt("need", "Need", c.group)}${opt("want", "Want", c.group)}</select>`, "Used for your 50/30/20 split.")}</div>`,
-    `${isNew ? "" : `<button class="btn danger" data-act="delCat" data-id="${c.id}">${ic("trash")}Delete</button>`}<button class="btn pri" data-act="saveCat" data-id="${isNew ? "" : c.id}">Save</button>`);
+    `${isNew || c.id === "other" ? "" : `<button class="btn danger" data-act="delCat" data-id="${c.id}">${ic("trash")}Delete</button>`}<button class="btn pri" data-act="saveCat" data-id="${isNew ? "" : c.id}">Save</button>`);
 }
 function saveCat(id) {
   const name = val("cN").trim(); if (!name) return bad("Give it a name.");
@@ -1439,45 +1581,58 @@ function saveCat(id) {
 }
 
 // ------------------------------------------------------------ goals
+// savings transfers for a goal that still have dates to come
+const goalRecs = (g, t) => S.rec.filter(r => r.kind === "save" && r.goal === g.id && E.active(r, E.addDays(t, 1)));
 function goalModal(g, preset = {}) {
   const isNew = !g, t = today(); g = g || { name: preset.name || "", emoji: preset.name ? "🛟" : "🎯", target: preset.v || "", by: "" };
-  const saved = isNew ? "" : E.goalSaved(S, g, t), lr = !isNew && S.rec.find(r => r.kind === "save" && r.goal === g.id && !r.off && (!r.end || r.end >= t));
+  const saved = isNew ? "" : E.r2(E.goalSaved(S, g, t)), L = isNew ? [] : goalRecs(g, t);
+  const plain = L.length === 1 && L[0].freq === "monthly", perM = E.r2(E.sum(L, E.perMonth));
+  const help = L.length && !plain ? `Right now: ${L.map(r => `${fmt(r.amount)} ${FREQ[r.freq]}`).join(" + ")} – about ${fmt(perM)} a month. Change the amount to switch to one monthly transfer.` : "Counts automatically as a savings transfer.";
   modal(isNew ? "New savings goal" : esc(g.name), `<div class="frow" style="grid-template-columns:80px 1fr">${field("Emoji", inp("gE", g.emoji))}${field("Name", inp("gN", g.name, { auto: true, ph: "Trip to Japan" }))}</div>
     <div class="frow">${field("Target", moneyInp("gT", g.target))}${field("Saved so far", moneyInp("gS", saved))}</div>
-    <div class="frow">${field("Reach it by (optional)", inp("gB", g.by || "", { type: "date" }))}${field("Put by each month", moneyInp("gM", lr ? lr.amount : g.monthly || ""), "Counts automatically as a savings transfer.")}</div>
-    ${field("On day", inp("gDay", lr ? E.pd(lr.start).getDate() : 1, { num: true }))}
+    <div class="frow">${field("Reach it by (optional)", inp("gB", g.by || "", { type: "date" }))}${field("Put by each month", moneyInp("gM", L.length ? (plain ? L[0].amount : perM) : g.monthly || ""), help)}</div>
+    ${field("On day", inp("gDay", L.length ? dayOf(L[0]) : 1, { num: true }), "1–31 · in shorter months it's the last day.")}
     <label class="row small"><input type="checkbox" id="gSep" ${g.separate ? "checked" : ""}> Kept in its own account (counts in net worth)</label>`,
     `${isNew ? "" : `<button class="btn danger" data-act="delGoal" data-id="${g.id}">${ic("trash")}Delete</button>`}<button class="btn pri" data-act="saveGoal" data-id="${isNew ? "" : g.id}">Save</button>`);
 }
+// first date on `day` after today (day 29–31 = last day in shorter months)
+function nextOnDay(t, day) { const d = E.addMonths(t.slice(0, 8) + "01", 0, day); return d > t ? d : E.addMonths(t.slice(0, 8) + "01", 1, day); }
 function saveGoal(id) {
-  const t = today(), name = val("gN").trim(), target = num(val("gT")), saved = num(val("gS")) || 0, monthly = num(val("gM")) || 0, day = clamp(parseInt(val("gDay")) || 1, 1, 28);
+  const t = today(), name = val("gN").trim(), target = num(val("gT")), saved = num(val("gS")) || 0, monthly = num(val("gM")) || 0, day = clamp(parseInt(val("gDay")) || 1, 1, 31);
   if (!name) return bad("Give it a name."); if (!(target > 0)) return bad("Type a target amount.");
   commit(() => {
     let g = id && S.goals.find(x => x.id === id);
+    const L = g ? goalRecs(g, t) : [], plain = L.length === 1 && L[0].freq === "monthly";
     const base = { name, emoji: val("gE").trim().slice(0, 4) || "🎯", target: E.r2(target), by: val("gB"), separate: $("#gSep").checked, monthly: E.r2(monthly) };
+    const wasNew = !g;
     if (!g) { g = { id: uid(), created: t, history: [], ...base }; S.goals.push(g); } else Object.assign(g, base);
-    g.saved = E.r2(saved); g.asOf = t; g.asTs = now();
-    // the linked monthly transfer
-    const lr = S.rec.find(r => r.kind === "save" && r.goal === g.id && !r.off && (!r.end || r.end >= t));
-    let nextD = `${t.slice(0, 8)}${E.pad(day)}`; if (nextD <= t) nextD = E.addMonths(nextD, 1, day);
-    if (monthly > 0 && !lr) S.rec.push({ id: uid(), kind: "save", name: "To " + name, amount: E.r2(monthly), freq: "monthly", start: nextD, goal: g.id, added: t, skip: {} });
-    else if (lr && monthly > 0 && (Math.abs(lr.amount - monthly) > .001 || E.pd(lr.start).getDate() !== day)) { lr.end = E.addDays(nextD, -1); if (lr.end < lr.start) S.rec = S.rec.filter(r => r !== lr); S.rec.push({ ...lr, id: uid(), amount: E.r2(monthly), start: nextD, end: "", name: "To " + name }); }
-    else if (lr && !(monthly > 0)) { lr.end = t; }
+    g.edited = !wasNew; g.saved = E.r2(saved); g.asOf = t; g.asTs = now();
+    // the linked transfer
+    const nextD = nextOnDay(t, day), tr = { amount: E.r2(monthly), freq: "monthly", end: "", name: "To " + name, day };
+    if (monthly > 0 && !L.length) S.rec.push({ id: uid(), ts: g.asTs + 1, kind: "save", start: nextD, goal: g.id, added: t, skip: {}, ...tr });
+    else if (monthly > 0 && plain) {
+      const lr = L[0];
+      if (Math.abs(lr.amount - monthly) > .001 || dayOf(lr) !== day) { if (lr.start >= nextD || !E.occ(lr, lr.start, E.addDays(nextD, -1)).length) Object.assign(lr, tr, { start: nextD }); else splitRec(lr, nextD, tr); }
+      else lr.name = tr.name;
+    } else if (monthly > 0) {
+      // weekly or several transfers: only touched when the monthly amount was changed
+      if (Math.abs(E.sum(L, E.perMonth) - monthly) > .01) { L.forEach(r => { r.end = E.addDays(nextD, -1); if (r.end < r.start || !E.occ(r, r.start, r.end).length) S.rec = S.rec.filter(x => x !== r); }); S.rec.push({ id: uid(), ts: g.asTs + 1, kind: "save", start: nextD, goal: g.id, added: t, skip: {}, ...tr }); }
+    } else L.forEach(r => endRec(r, t));
   }, "goal");
   closeModal(); render();
 }
-function moneyMove(title, cb, label = "Add") {
-  modal(title, field("How much", moneyInp("mvA", "", { auto: true })) + field("Date", inp("mvD", today(), { type: "date" })), `<button class="btn pri" data-act="mvOk">${label}</button>`);
-  ACT.mvOk = () => { const a = num(val("mvA")); if (!(a > 0)) return bad("Type an amount."); cb(E.r2(a), val("mvD") || today()); closeModal(); render(); };
+function moneyMove(title, cb, label = "Add", note = "") {
+  modal(title, (note ? `<p class="small muted" style="margin-top:0">${note}</p>` : "") + field("How much", moneyInp("mvA", "", { auto: true })) + field("Date", inp("mvD", today(), { type: "date" })), `<button class="btn pri" data-act="mvOk">${label}</button>`);
+  ACT.mvOk = () => { const a = num(val("mvA")); if (!(a > 0)) return bad("Type an amount."); if (cb(E.r2(a), val("mvD") || today()) === false) return; closeModal(); render(); };
 }
 
 // ------------------------------------------------------------ debts
 function debtModal(d) {
   const isNew = !d, t = today(); d = d || { name: "", balance: "", apr: "", min: "", dueDay: "" };
-  const lr = !isNew && S.rec.find(r => r.kind === "debt" && r.debt === d.id && !r.off && (!r.end || r.end >= t));
+  const lr = !isNew && S.rec.find(r => r.kind === "debt" && r.debt === d.id && E.active(r, E.addDays(t, 1)));
   modal(isNew ? "Add a debt" : esc(d.name), `${field("Name", inp("dN", d.name, { auto: true, ph: "Visa card, car loan…" }))}
     <div class="frow">${field("Balance today", moneyInp("dB", isNew ? "" : E.debtBal(S, d, t)))}${field("Interest (APR %)", inp("dR", d.apr, { num: true, ph: "19.9" }))}</div>
-    <div class="frow">${field("Minimum payment", moneyInp("dM", d.min))}${field("Due day", inp("dD", d.dueDay, { num: true, ph: "15" }))}</div>
+    <div class="frow">${field("Minimum payment", moneyInp("dM", d.min))}${field("Due day", inp("dD", d.dueDay, { num: true, ph: "15" }), "1–31 · in shorter months it's the last day.")}</div>
     ${field("Your order (for “My order”)", inp("dO", d.order || "", { num: true, ph: "1" }))}
     <label class="row small"><input type="checkbox" id="dAuto" ${isNew || lr ? "checked" : ""}> Count the minimum as a monthly payment on its due day</label>`,
     `${isNew ? "" : `<button class="btn danger" data-act="delDebt" data-id="${d.id}">${ic("trash")}Delete</button>`}<button class="btn pri" data-act="saveDebt" data-id="${isNew ? "" : d.id}">Save</button>`);
@@ -1489,12 +1644,11 @@ function saveDebt(id) {
     let d = id && S.debts.find(x => x.id === id);
     const base = { name, balance: E.r2(bal), asOf: t, asTs: now(), apr: num(val("dR")) || 0, min: E.r2(min), dueDay: due, order: parseInt(val("dO")) || 0 };
     if (!d) { d = { id: uid(), history: [], ...base }; S.debts.push(d); } else Object.assign(d, base);
-    const lr = S.rec.find(r => r.kind === "debt" && r.debt === d.id && !r.off && (!r.end || r.end >= t));
-    let nextD = `${t.slice(0, 8)}${E.pad(Math.min(due, 28))}`; if (nextD <= t) nextD = E.addMonths(nextD, 1, due);
-    const auto = $("#dAuto").checked;
-    if (auto && min > 0 && !lr) S.rec.push({ id: uid(), kind: "debt", name, amount: E.r2(min), freq: "monthly", start: nextD, debt: d.id, added: t, skip: {}, cat: "" });
-    else if (lr && auto && (Math.abs(lr.amount - min) > .001 || E.pd(lr.start).getDate() !== due)) { lr.end = E.addDays(nextD, -1); if (lr.end < lr.start) S.rec = S.rec.filter(r => r !== lr); S.rec.push({ ...lr, id: uid(), amount: E.r2(min), start: nextD, end: "", name }); }
-    else if (lr && !auto) lr.end = t;
+    const lr = S.rec.find(r => r.kind === "debt" && r.debt === d.id && E.active(r, E.addDays(t, 1)));
+    const nextD = nextOnDay(t, due), auto = $("#dAuto").checked, tr = { amount: E.r2(min), freq: "monthly", end: "", name, day: due };
+    if (auto && min > 0 && !lr) S.rec.push({ id: uid(), ts: d.asTs + 1, kind: "debt", start: nextD, debt: d.id, added: t, skip: {}, cat: "", ...tr });
+    else if (lr && auto && (Math.abs(lr.amount - min) > .001 || dayOf(lr) !== due)) { if (lr.start >= nextD || !E.occ(lr, lr.start, E.addDays(nextD, -1)).length) Object.assign(lr, tr, { start: nextD }); else splitRec(lr, nextD, tr); }
+    else if (lr && !auto) endRec(lr, t);
     if (lr) lr.name = name;
   }, "debt");
   closeModal(); render();
@@ -1509,7 +1663,7 @@ function assetModal(a, kind) {
 }
 function acctModal(a) {
   const isNew = !a, t = today(); a = a || { name: "", type: "everyday", amount: "" };
-  const cur_ = isNew ? "" : (a.type === "everyday" || a.type === "cash") && S.accounts.filter(x => x.type === "everyday" || x.type === "cash").length === 1 ? E.balanceNow(S, t) : a.amount;
+  const cur_ = isNew ? "" : E.acctNow(S, a, t);
   modal(isNew ? "Add an account" : esc(a.name), `${field("Name", inp("acN", a.name, { auto: true, ph: "Checking, savings…" }))}
     <div class="frow">${field("Balance today", moneyInp("acV", cur_), "What your bank app says right now.")}${field("Type", `<select class="inp" id="acT">${[["everyday", "Everyday (checking)"], ["cash", "Cash"], ["savings", "Savings"], ["invest", "Investments"], ["credit", "Credit card (owed)"], ["other", "Other"]].map(([v, l]) => opt(v, l, a.type)).join("")}</select>`)}</div>`,
     `${isNew || S.accounts.length < 2 ? "" : `<button class="btn danger" data-act="delAcct" data-id="${a.id}">${ic("trash")}Delete</button>`}<button class="btn pri" data-act="saveAcct" data-id="${isNew ? "" : a.id}">Save</button>`);
@@ -1540,7 +1694,7 @@ function vSettings() {
   const you = `<div class="frow">${field("Your name (optional)", `<input class="inp" data-set="name" value="${esc(st.name)}" placeholder="for the greeting">`)}${field("Currency", `<select class="inp" data-set="currency">${CURRENCIES.map(c => opt(c, c, st.currency)).join("")}</select>`)}</div>
     <div class="frow">${field("Weeks start on", `<select class="inp" data-set="weekStart">${opt(1, "Monday", st.weekStart)}${opt(0, "Sunday", st.weekStart)}</select>`)}${field("No-spend goal (days a month)", `<input class="inp" data-set="nospendGoal" inputmode="numeric" value="${st.nospendGoal}">`)}</div>
     ${field("Your split: needs / wants / savings & debt (%)", `<div class="frow" style="grid-template-columns:1fr 1fr 1fr">${st.split.map((v, i) => `<input class="inp" data-set="split${i}" inputmode="numeric" value="${v}">`).join("")}</div>`)}`;
-  const accts = `<div class="list">${S.accounts.map(a => `<div class="item click" data-act="editAcct" data-id="${a.id}"><div class="emo">🏦</div><div class="grow"><div class="nm">${esc(a.name)}</div><div class="tiny muted">${({ everyday: "everyday", cash: "cash", savings: "savings", invest: "investments", credit: "credit card", other: "other" })[a.type]} · checked ${a.date ? rel(a.date) : "–"}</div></div><span class="amt">${fmt((a.type === "everyday" || a.type === "cash") && S.accounts.filter(x => x.type === "everyday" || x.type === "cash").length === 1 ? E.balanceNow(S, today()) : a.amount)}</span></div>`).join("")}</div>
+  const accts = `<div class="list">${S.accounts.map(a => `<div class="item click" data-act="editAcct" data-id="${a.id}"><div class="emo">🏦</div><div class="grow"><div class="nm">${esc(a.name)}</div><div class="tiny muted">${({ everyday: "everyday", cash: "cash", savings: "savings", invest: "investments", credit: "credit card", other: "other" })[a.type]} · checked ${a.date ? rel(a.date) : "–"}</div></div><span class="amt">${fmt(E.acctNow(S, a, today()))}</span></div>`).join("")}</div>
     <button class="btn sm" data-act="newAcct">${ic("plus")}Add an account</button><p class="help">Your everyday balance moves by itself with what you log and the repeats on their dates. Update it from your bank app now and then to keep Look ahead sharp.</p>`;
   const cats = `<div class="list">${S.cats.map(c => `<div class="item click" data-act="editCat" data-id="${c.id}"><div class="emo">${esc(c.emoji)}</div><div class="grow"><div class="nm">${esc(c.name)}</div><div class="tiny muted">${c.group === "need" ? "need" : "want"}</div></div><span class="amt">${c.budget ? fmt0(c.budget) : "–"}</span></div>`).join("")}</div><button class="btn sm" data-act="newCat">${ic("plus")}Add a category</button>`;
   const rules = `${S.rules.length ? `<div class="list">${S.rules.map(r => `<div class="item"><div class="grow"><div class="nm">“${esc(r.match)}”</div><div class="tiny muted">→ ${r.name ? "call it " + esc(r.name) + ", " : ""}${esc(catOf(r.cat).name)}</div></div><button class="iconbtn" data-act="delRule" data-id="${r.id}" aria-label="Delete rule">${ic("trash")}</button></div>`).join("")}</div>` : `<p class="muted small">No rules yet. When you import a bank file, tick “remember” and the categories you pick are used next time.</p>`}
@@ -1575,7 +1729,7 @@ function vOnboard() {
     <p class="muted">Know what you can spend today, where every dollar went, and when you'll reach your goals. Everything stays on this device.</p>
     <div class="card pad mt">${field("What should I call you? (optional)", `<input class="inp" id="obName" value="${esc(st.name)}" autofocus>`)}${field("Your currency", `<select class="inp" id="obCur">${CURRENCIES.map(c => opt(c, c, st.currency)).join("")}</select>`)}
     <div class="caps" style="margin-bottom:8px">Pick your colors</div><div class="themes">${Object.entries(THEMES).map(([k, [a, b]]) => `<button class="${st.theme === k ? "on" : ""}" data-act="setTheme" data-v="${k}"><span class="sw"><i style="background:${a}"></i><i style="background:${b}"></i></span>${k}</button>`).join("")}</div></div>
-    <div class="row sb wrap mt"><button class="link" data-act="obSample">Explore with example data first</button><button class="btn pri" data-act="obNext">Next ${ic("right")}</button></div>`;
+    <div class="row sb wrap mt"><div class="col" style="gap:6px;align-items:flex-start"><button class="link" data-act="obSample">Explore with example data first</button><button class="link" data-act="restore">Restore from a backup (new phone or computer)</button></div><button class="btn pri" data-act="obNext">Next ${ic("right")}</button></div>`;
   else if (s === 1) body = `<div class="caps">Step 2 of 3</div><h1 style="margin:6px 0 10px">Your pay</h1><p class="muted">Your paydays count by themselves – no typing every month.</p>
     <div class="card pad">${field("How much comes in each time (after tax)?", moneyInp("obPay", d.pay || "", { auto: true }))}
     <div class="frow">${field("How often", `<select class="inp" id="obFreq">${["weekly", "biweekly", "semimonthly", "monthly", "4weekly"].map(k => opt(k, FREQ[k][0].toUpperCase() + FREQ[k].slice(1), d.freq || "biweekly")).join("")}</select>`)}${field("Next payday", inp("obNext", d.next || E.addDays(today(), 7), { type: "date" }))}</div>
@@ -1598,9 +1752,9 @@ const OB_FREQ = [["monthly", "Monthly"], ["yearly", "Yearly"], ["quarterly", "Ev
 const OB_START = ["Rent / mortgage", "Electricity & water", "Phone", "Internet", "Netflix", "Spotify", "Gym"];
 const OB_MORE = ["Health insurance", "Car insurance", "Car payment", "Transit pass", "Renter's insurance", "Loan payment", "Credit card", "Childcare", "Pet insurance", "Disney+", "Amazon Prime", "YouTube Premium", "iCloud", "Apple Music", "Gaming", "Software", "Donation"];
 const OB_GUESS = [[/rent|mortgage/i, "rent", "🏠", "bill"], [/electric|water|gas|heat|energy|utilit/i, "utilities", "💡", "bill"], [/phone|internet|wifi|mobile/i, "phone", "📱", "bill"],
-  [/insurance/i, "insurance", "🛡️", "bill"], [/car|transit|bus|train|parking|fuel/i, "transport", "🚗", "bill"], [/health|doctor|dental/i, "health", "💊", "bill"],
-  [/netflix|spotify|disney|prime|youtube|icloud|apple|hulu|hbo|music|gaming|game|software|adobe|patreon|gym|fitness|club/i, "subs", "🔁", "sub"], [/pet|dog|cat\b/i, "other", "🐾", "bill"],
-  [/loan|credit|debt/i, "other", "💳", "bill"], [/child|school|daycare/i, "other", "🧸", "bill"], [/donat|charity/i, "gifts", "🤍", "bill"]];
+  [/insurance/i, "insurance", "🛡️", "bill"], [/\b(car|cars|transit|bus|train|parking|fuel)\b/i, "transport", "🚗", "bill"], [/\b(health|doctor|dental)/i, "health", "💊", "bill"],
+  [/netflix|spotify|disney|prime|youtube|icloud|apple|hulu|hbo|music|gaming|game|software|adobe|patreon|gym|fitness|club/i, "subs", "🔁", "sub"], [/\b(pet|pets|dog|dogs|cat|cats)\b/i, "other", "🐾", "bill"],
+  [/loan|credit|debt/i, "other", "💳", "bill"], [/child|school|daycare|nanny|babysit/i, "other", "🧸", "bill"], [/donat|charity/i, "gifts", "🤍", "bill"]];
 function obGuess(n) { const g = OB_GUESS.find(([re]) => re.test(n || "")); return g ? { cat: g[1], emoji: g[2], kind: g[3] } : { cat: "other", emoji: "🧾", kind: "bill" }; }
 function obRow(name) { return { name, amount: "", freq: /prime|insurance/i.test(name) && /prime/i.test(name) ? "yearly" : "monthly", next: "", emoji: obGuess(name).emoji }; }
 function obCollect() {
@@ -1615,13 +1769,13 @@ function obCollect() {
 function obFinish() {
   obCollect();
   const t = today(), d = OB.d;
-  const pay = num(d.pay); if (pay > 0 && d.next) S.rec.push({ id: uid(), kind: "income", name: "Paycheck", amount: E.r2(pay), freq: d.freq, start: d.next, added: t, skip: {}, cat: "" });
-  const bal = num(d.bal); if (bal >= 0 && !isNaN(bal)) Object.assign(S.accounts[0], { amount: E.r2(bal), date: t });
+  const pay = num(d.pay); if (pay > 0) S.rec.push({ id: uid(), ts: now(), kind: "income", name: "Paycheck", amount: E.r2(pay), freq: d.freq || "biweekly", start: d.next || t, added: t, skip: {}, cat: "" });
+  const bal = num(d.bal); if (bal >= 0 && !isNaN(bal)) Object.assign(S.accounts[0], { amount: E.r2(bal), date: t, asTs: now() });
   const firstNext = E.addMonths(t.slice(0, 8) + "01", 1, 1);
   (d.bills || []).forEach(b => {
     const a = num(b.amount), name = (b.name || "").trim(); if (!(a > 0) || !name) return;
     const g = obGuess(name), freq = b.freq || "monthly";
-    S.rec.push({ id: uid(), kind: g.kind, name, amount: E.r2(a), freq, start: b.next || firstNext, cat: S.cats.some(c => c.id === g.cat) ? g.cat : "other", added: t, skip: {} });
+    S.rec.push({ id: uid(), ts: now(), kind: g.kind, name, amount: E.r2(a), freq, start: b.next || firstNext, cat: S.cats.some(c => c.id === g.cat) ? g.cat : "other", added: t, skip: {} });
     const c = S.cats.find(x => x.id === g.cat); if (c && g.kind === "bill") c.budget = E.r2((+c.budget || 0) + E.perMonth({ freq, amount: a }));
   });
   const subsC = S.cats.find(c => c.id === "subs"); if (subsC) subsC.budget = E.r2(E.sum(S.rec.filter(r => r.kind === "sub"), E.perMonth));
@@ -1814,38 +1968,71 @@ const ACT = {
   skipOcc: d => { const r = S.rec.find(x => x.id === d.id); commit(() => { r.skip = r.skip || {}; r.skip[d.d] = true; }, "skip"); toast(`Skipped ${esc(r.name)} on ${dshort(d.d)}.`, () => undo()); },
   cancelled: d => { const r = S.rec.find(x => x.id === d.id); commit(() => { const nx = E.recOcc({ rec: [r] }, today(), E.addDays(today(), 400))[0]; r.end = nx ? E.addDays(nx.date, -1) : today(); r.cancelBy = ""; if (r.end < r.start) S.rec = S.rec.filter(x => x !== r); }, "cancel"); toast(`Nice – ${esc(r.name)} won't count any more.`, () => undo()); },
   paidOcc: d => { const r = S.rec.find(x => x.id === d.id); if (!r) return; const on = !(r.paid || {})[d.d];
-    commit(() => { r.paid = r.paid || {}; if (on) r.paid[d.d] = true; else delete r.paid[d.d]; }, on ? "mark paid" : "unmark paid");
+    commit(() => { r.paid = r.paid || {}; if (on) r.paid[d.d] = now(); else delete r.paid[d.d]; }, on ? "mark paid" : "unmark paid");
     if (modalOpen && modalOpen.querySelector("[data-act=paidOcc]")) dayModal(d.d);
     if (on) toast(`✓ ${esc(r.name)} marked as paid.`); },
   billKind: d => { VS.billKind = d.v; render(); },
   // categories
   editCat: d => catModal(S.cats.find(c => c.id === d.id)), newCat: () => catModal(null), saveCat: d => saveCat(d.id),
-  delCat: d => { const used = S.tx.some(x => x.cat === d.id); commit(() => { S.cats = S.cats.filter(c => c.id !== d.id); if (used) S.tx.forEach(x => { if (x.cat === d.id) x.cat = "other"; }); }, "delete category"); closeModal(); toast(used ? "Deleted – its spending moved to Other." : "Deleted.", () => undo()); },
+  delCat: d => {
+    if (d.id === "other") return bad("“Other” catches everything without a category, so it stays.");
+    if (S.cats.length <= 1) return bad("Keep at least one category.");
+    const used = S.tx.some(x => x.cat === d.id) || S.rec.some(r => r.cat === d.id);
+    commit(() => {
+      S.cats = S.cats.filter(c => c.id !== d.id);
+      if (!S.cats.some(c => c.id === "other")) S.cats.push({ ...DEFAULT_CATS.find(c => c.id === "other") });
+      S.tx.forEach(x => { if (x.cat === d.id) x.cat = "other"; }); S.rec.forEach(r => { if (r.cat === d.id) r.cat = "other"; }); S.rules.forEach(r => { if (r.cat === d.id) r.cat = "other"; });
+    }, "delete category");
+    closeModal(); toast(used ? "Deleted – its spending and bills moved to Other." : "Deleted.", () => undo());
+  },
   // goals
   newGoal: d => goalModal(null, { name: d.name, v: d.v }), editGoal: d => goalModal(S.goals.find(g => g.id === d.id)), saveGoal: d => saveGoal(d.id),
-  delGoal: d => { commit(() => { S.goals = S.goals.filter(g => g.id !== d.id); S.rec.forEach(r => { if (r.goal === d.id) r.end = r.end || today(); }); }, "delete goal"); closeModal(); toast("Deleted.", () => undo()); },
-  goalAdd: d => { const g = S.goals.find(x => x.id === d.id); moneyMove(`Add to ${esc(g.name)}`, (a, date) => { commit(() => { g.history = g.history || []; g.history.push({ date, amount: a, ts: now() }); }, "add money"); const p = E.goalPace(S, g, today()); toast(p.done ? `🎉 ${esc(g.name)} reached!` : `${fmt(a)} added.`); }); },
-  goalTake: d => { const g = S.goals.find(x => x.id === d.id); moneyMove(`Take out of ${esc(g.name)}`, (a, date) => { commit(() => { g.history = g.history || []; g.history.push({ date, amount: -a, ts: now() }); }, "take out"); toast(`${fmt(a)} taken out.`); }, "Take out"); },
+  delGoal: d => { commit(() => { S.goals = S.goals.filter(g => g.id !== d.id); S.rec.filter(r => r.goal === d.id).forEach(r => endRec(r, today())); }, "delete goal"); closeModal(); toast("Deleted.", () => undo()); },
+  goalAdd: d => { const g = S.goals.find(x => x.id === d.id); moneyMove(`Add to ${esc(g.name)}`, (a, date) => { commit(() => { g.history = g.history || []; g.history.push({ date, amount: a, ts: now() }); }, "add money"); const p = E.goalPace(S, g, today()); toast(date > today() ? `${fmt(a)} – it's added on ${dshort(date)}.` : p.done ? `🎉 ${esc(g.name)} reached!` : `${fmt(a)} added.`); }, "Add", g.separate ? "It comes out of your everyday account." : ""); },
+  goalTake: d => {
+    const g = S.goals.find(x => x.id === d.id), have = E.r2(E.goalSaved(S, g, today()));
+    if (!(have > 0)) return toast(`There's nothing in ${esc(g.name)} to take out yet.`);
+    moneyMove(`Take out of ${esc(g.name)}`, (a, date) => {
+      const take = Math.min(a, have);
+      commit(() => { g.history = g.history || []; g.history.push({ date: date < today() ? date : today(), amount: -take, ts: now() }); }, "take out");
+      toast(take < a ? `Only ${fmt(take)} was in there – took that out.` : `${fmt(take)} taken out.`);
+    }, "Take out", `${fmt(have)} is in there now.`);
+  },
+  stopGoalRec: d => { const g = S.goals.find(x => x.id === d.id); if (!g) return; commit(() => goalRecs(g, today()).forEach(r => endRec(r, today())), "stop transfer"); toast(`The transfer to ${esc(g.name)} is stopped.`, () => undo()); },
   setEf: d => { commit(() => { S.goals.find(g => g.id === d.id).target = +d.v; }, "goal"); },
   makePot: d => {
-    const r = S.rec.find(x => x.id === d.id), t = today(), P = E.pots(S, t).find(p => p.r.id === r.id);
+    const r = S.rec.find(x => x.id === d.id), t = today(), P = r && E.pots(S, t).find(p => p.r.id === r.id);
+    if (!P || !P.next) return toast("There's no date coming up for it.");
+    if (!P.transfers) return toast(`${esc(r.name)} is due ${rel(P.next)} – too soon to save up for it.`);
+    const amt = Math.ceil(P.aside);
+    if (!(amt > 0)) return toast(`The pot for ${esc(r.name)} already has enough.`);
     commit(() => {
-      const g = { id: uid(), name: r.name, emoji: "🫙", target: r.amount, saved: 0, asOf: t, created: t, history: [], pot: r.id };
-      S.goals.push(g); S.rec.push({ id: uid(), kind: "save", name: "Pot: " + r.name, amount: E.r2(Math.ceil(P.aside)), freq: "monthly", start: E.addDays(t, 1), end: P.next ? E.addDays(P.next, -1) : "", goal: g.id, added: t, skip: {} });
+      let g = P.goal;
+      if (g) g.target = E.r2(+r.amount); // the pot stays, a new round of saving starts
+      else { g = { id: uid(), name: r.name, emoji: "🫙", target: E.r2(+r.amount), saved: 0, asOf: t, asTs: now(), created: t, history: [], pot: r.id }; S.goals.push(g); }
+      S.rec.push({ id: uid(), ts: now(), kind: "save", name: "Pot: " + r.name, amount: amt, freq: "monthly", start: E.addDays(t, 1), end: E.addDays(P.next, -1), goal: g.id, added: t, skip: {} });
     }, "pot");
-    toast(`A pot for ${esc(r.name)}: ${fmt(Math.ceil(P.aside))} a month until ${P.next ? dshort(P.next) : "it's due"}.`, () => undo());
+    toast(`A pot for ${esc(r.name)}: ${fmt(amt)} a month, ${P.transfers} time${P.transfers === 1 ? "" : "s"} before ${dshort(P.next)}.`, () => undo());
   },
   // debt
   newDebt: () => debtModal(null), editDebt: d => debtModal(S.debts.find(x => x.id === d.id)), saveDebt: d => saveDebt(d.id),
-  delDebt: d => { commit(() => { S.debts = S.debts.filter(x => x.id !== d.id); S.rec.forEach(r => { if (r.debt === d.id) r.end = r.end || today(); }); }, "delete debt"); closeModal(); toast("Deleted.", () => undo()); },
-  debtPay: d => { const x = S.debts.find(y => y.id === d.id); moneyMove(`Payment to ${esc(x.name)}`, (a, date) => { commit(() => { x.history = x.history || []; x.history.push({ date, amount: a, ts: now() }); }, "payment"); toast(E.debtBal(S, x, today()) <= 0 ? `🕊️ ${esc(x.name)} is paid off!` : `${fmt(a)} paid.`); }, "Log payment"); },
+  delDebt: d => { commit(() => { S.debts = S.debts.filter(x => x.id !== d.id); S.rec.filter(r => r.debt === d.id).forEach(r => endRec(r, today())); }, "delete debt"); closeModal(); toast("Deleted.", () => undo()); },
+  debtPay: d => {
+    const x = S.debts.find(y => y.id === d.id), owed = E.r2(E.debtBal(S, x, today()));
+    if (!(owed > 0)) return toast(`${esc(x.name)} is already paid off 🎉`);
+    moneyMove(`Payment to ${esc(x.name)}`, (a, date) => {
+      const pay = Math.min(a, owed);
+      commit(() => { x.history = x.history || []; x.history.push({ date, amount: pay, ts: now() }); }, "payment");
+      toast(pay < a ? `That's more than the ${fmt(owed)} left – logged ${fmt(pay)}.` : date > today() ? `${fmt(pay)} – it counts on ${dshort(date)}.` : E.debtBal(S, x, today()) <= 0 ? `🕊️ ${esc(x.name)} is paid off!` : `${fmt(pay)} paid.`);
+    }, "Log payment", `${fmt(owed)} left to pay. It comes out of your everyday account.`);
+  },
   method: d => { S.settings.method = d.v; save(); render(); },
   // net worth
   newAsset: d => assetModal(null, d.k), editAsset: d => assetModal(S.assets.find(a => a.id === d.id)),
   saveAsset: d => { const name = val("aN").trim(), v = num(val("aV")); if (!name) return bad("Give it a name."); if (isNaN(v)) return bad("Type what it's worth."); commit(() => { const data = { name, emoji: val("aE").trim().slice(0, 4) || "✨", value: E.r2(v), kind: val("aK") }; if (d.id) Object.assign(S.assets.find(a => a.id === d.id), data); else S.assets.push({ id: uid(), ...data }); }, "asset"); closeModal(); },
   delAsset: d => { commit(() => { S.assets = S.assets.filter(a => a.id !== d.id); }, "delete"); closeModal(); toast("Deleted.", () => undo()); },
   newAcct: () => acctModal(null), editAcct: d => acctModal(S.accounts.find(a => a.id === d.id)),
-  saveAcct: d => { const name = val("acN").trim(), v = num(val("acV")); if (!name) return bad("Give it a name."); if (isNaN(v)) return bad("Type the balance."); commit(() => { const data = { name, type: val("acT"), amount: E.r2(v), date: today() }; if (d.id) Object.assign(S.accounts.find(a => a.id === d.id), data); else S.accounts.push({ id: uid(), ...data }); }, "account"); closeModal(); toast("Balance updated."); },
+  saveAcct: d => { const name = val("acN").trim(), v = num(val("acV")); if (!name) return bad("Give it a name."); if (isNaN(v)) return bad("Type the balance."); commit(() => { const data = { name, type: val("acT"), amount: E.r2(v), date: today(), asTs: now() }; if (d.id) Object.assign(S.accounts.find(a => a.id === d.id), data); else S.accounts.push({ id: uid(), ...data }); }, "account"); closeModal(); toast("Balance updated."); },
   delAcct: d => { commit(() => { S.accounts = S.accounts.filter(a => a.id !== d.id); }, "delete"); closeModal(); toast("Deleted.", () => undo()); },
   // planning
   afford: () => affordModal(), afCheck: () => { $("#afR").innerHTML = affordResult(num(val("afA"))); },
@@ -1856,12 +2043,12 @@ const ACT = {
   delRule: d => { commit(() => { S.rules = S.rules.filter(r => r.id !== d.id); }, "delete rule"); },
   backup: () => backup(), restore: () => { if (DEMO) return toast("This works in the full planner."); restore(); }, share: () => shareBackup(), install: () => installApp(),
   resetAll: () => { modal("Start fresh?", `<p>This deletes everything in the planner on this device. Download a backup first if you might want it back.</p>`, `<button class="btn" data-act="backup">Download a backup</button><button class="btn danger" data-act="resetOk">Delete everything</button>`); },
-  resetOk: () => { if (DEMO) return toast("Not in the demo."); const keep = { theme: S.settings.theme, currency: S.settings.currency }; S = blank(); Object.assign(S.settings, keep); OB = { step: 0, d: {} }; flush(); closeModal(); location.hash = ""; render(); },
+  resetOk: () => { if (DEMO) { closeModal(); return toast("Not in the demo – nothing you do here is saved anyway."); } const keep = { theme: S.settings.theme, currency: S.settings.currency }; S = blank(); Object.assign(S.settings, keep); OB = { step: 0, d: {} }; flush(); closeModal(); location.hash = ""; render(); },
   setTheme: d => { if (!S.setup && !DEMO) obCollect(); S.settings.theme = d.v; save(); render(); }, setDark: d => { S.settings.dark = d.v; save(); render(); },
   // onboarding
   obAdd: d => { obCollect(); OB.d.bills.push(obRow(d.n)); render(); const rows = document.querySelectorAll('.obrow [data-obf="' + (d.n ? 'amount' : 'name') + '"]'); rows.length && rows[rows.length - 1].focus(); },
   obDel: d => { obCollect(); OB.d.bills.splice(+d.i, 1); render(); },
-  obNext: () => { obCollect(); OB.step++; render(); }, obBack: () => { obCollect(); OB.step--; render(); }, obSkip: () => { OB.d.pay = ""; OB.step++; render(); }, obDone: () => obFinish(),
+  obNext: () => { obCollect(); if (OB.step === 1 && num(OB.d.pay) > 0 && !OB.d.next) return bad("Pick your next payday so your pay can count."); OB.step++; render(); }, obBack: () => { obCollect(); OB.step--; render(); }, obSkip: () => { OB.d.pay = ""; OB.step++; render(); }, obDone: () => obFinish(),
   obSample: () => { const s = window.BP_SAMPLE(); s.settings.theme = S.settings.theme; s.settings.currency = val("obCur") || S.settings.currency; s.sample = true; S = migrate(s); S.setup = true; S.sample = true; save(); go("home"); render(); toast("This is example data – Settings › Start fresh clears it."); },
   simple: d => { S.settings.simple = d.v === "1"; save(); render(); },
   hideStart: () => { S.settings.hideStart = true; save(); render(); toast("Hidden – you'll find everything in the menu."); },

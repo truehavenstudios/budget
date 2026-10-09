@@ -1,3 +1,0 @@
-User-agent: *
-Disallow: /budget/app-b8m3t6w2/
-Disallow: /app-b8m3t6w2/

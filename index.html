@@ -392,7 +392,7 @@ body{--acc:var(--a);--acc2:var(--a1);--hl:var(--a)}
 @media (max-width:600px){.welcome h1{font-size:2.5rem}.welcome{padding:32px 18px}}
 </style></head>
 <body data-theme="Blush"><div id="root"></div>
-<script>window.BP_DEMO=true;window.BP_SHOP="https://www.etsy.com/shop/TrueHavenStudios";window.BP_VERSION="1.0.0";window.BP_SYNC_URL="https://truehaven-sync.fishing-switzerland.workers.dev";</script>
+<script>window.BP_DEMO=true;window.BP_SHOP="https://www.etsy.com/shop/TrueHavenStudios";window.BP_VERSION="1.0.1";window.BP_SYNC_URL="https://truehaven-sync.fishing-switzerland.workers.dev";</script>
 <script>/* TrueHaven Sync – end-to-end-encrypted device sync for the offline apps (client module).
    One file, no libraries, WebCrypto only. Works in browsers and in Node 20+ (for tests).
 
@@ -1267,7 +1267,8 @@ const E = (() => {
   // so a same-day transfer counts – also for repeats made before timestamps existed. After an edit it's in the base if the repeat existed then.
   const occInBase = (b, o) => {
     const tk = tickTs(o);
-    if (o.date < b.asOf) return true;
+    // a savings transfer set up after the base was typed can't be in it: its earlier dates count once they're ticked (never by themselves)
+    if (o.date < b.asOf) return !(o.r.kind === "save" && (+o.r.ts || 0) > b.asTs && tk > b.asTs);
     if (o.date === b.asOf && b.edited !== false && !((+o.r.ts || 0) > b.asTs)) return true;   // was due when the base was typed
     return tk > 0 && tk <= b.asTs;                                                                // ticked before the base was typed
   };
@@ -1405,6 +1406,9 @@ const E = (() => {
       if (e.o) { if (occCounts(b, e.o, today)) v += e.v; }           // a bill ticked as paid early is gone already
       else if (e.date <= today && (e.date > b.asOf || (+e.ts || 0) > b.asTs)) v += e.v; // logged after the balance check
     });
+    // savings transfers dated before the balance check but set up after it: they count once ticked (see occInBase)
+    const P = primary(st);
+    if (P && P.id === a.id) recOcc(st, "1970-01-01", addDays(b.asOf, -1), ["save"]).forEach(o => { if (!(physical && staysHome(st, o.r)) && occCounts(b, o, today)) v -= o.amount; });
     return v;
   }
   // money in everyday accounts today
@@ -1459,7 +1463,7 @@ const E = (() => {
   const goalOccCounts = (g, o, today) => occCounts(gBase(g, today), o, today);
   function goalSaved(st, g, today) {
     const b = gBase(g, today), ev = [];
-    recOcc(st, b.asOf, addDays(today, 400), ["save"]).forEach(o => { if (o.r.goal === g.id && occCounts(b, o, today)) ev.push([o.date, o.amount]); });
+    recOcc(st, "1970-01-01", addDays(today, 400), ["save"]).forEach(o => { if (o.r.goal === g.id && occCounts(b, o, today)) ev.push([o.date, o.amount]); });
     (g.history || []).forEach(h => { if (!h.rec && histCounts(b, h, today)) ev.push([h.date, +h.amount || 0]); });
     if (!g.pot) return (+g.saved || 0) + sum(ev, e => e[1]);
     // a pot for a big bill: the bill is paid out of it when it's due (or ticked), and a pot never goes below zero
@@ -2840,7 +2844,8 @@ const ACT = {
   paidOcc: d => { const r = S.rec.find(x => x.id === d.id); if (!r) return; const on = !(r.paid || {})[d.d];
     commit(() => { r.paid = r.paid || {}; if (on) r.paid[d.d] = now(); else delete r.paid[d.d]; }, on ? "mark paid" : "unmark paid");
     if (modalOpen && modalOpen.querySelector("[data-act=paidOcc]")) dayModal(d.d);
-    if (on) toast(`✓ ${esc(r.name)} marked as paid.`); },
+    if (on) { const g = r.kind === "save" && r.goal && S.goals.find(x => x.id === r.goal);
+      toast(g ? `✓ ${esc(r.name)} marked as paid · ${esc(g.name)}: ${fmt(E.goalSaved(S, g, today()))} saved.` : `✓ ${esc(r.name)} marked as paid.`); } },
   billKind: d => { VS.billKind = d.v; render(); },
   // categories
   editCat: d => catModal(S.cats.find(c => c.id === d.id)), newCat: () => catModal(null), saveCat: d => saveCat(d.id),

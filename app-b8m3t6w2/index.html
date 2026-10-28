@@ -392,7 +392,7 @@ body{--acc:var(--a);--acc2:var(--a1);--hl:var(--a)}
 @media (max-width:600px){.welcome h1{font-size:2.5rem}.welcome{padding:32px 18px}}
 </style></head>
 <body data-theme="Blush"><div id="root"></div>
-<script>window.BP_DEMO=false;window.BP_SHOP="https://www.etsy.com/shop/TrueHavenStudios";window.BP_VERSION="1.0.1";window.BP_SYNC_URL="https://truehaven-sync.fishing-switzerland.workers.dev";</script>
+<script>window.BP_DEMO=false;window.BP_SHOP="https://www.etsy.com/shop/TrueHavenStudios";window.BP_VERSION="1.1.0";window.BP_SYNC_URL="https://truehaven-sync.fishing-switzerland.workers.dev";</script>
 <script>/* TrueHaven Sync – end-to-end-encrypted device sync for the offline apps (client module).
    One file, no libraries, WebCrypto only. Works in browsers and in Node 20+ (for tests).
 
@@ -2551,6 +2551,7 @@ function vSettings() {
   return head("Make it yours", "Settings", "", "Colors, accounts, categories and your data.") + `<div class="grid g2 start">${card("You", you)}${card("Look", themes, { b: true })}</div>
     <div class="grid g2 mt start">${card("Accounts", accts, { b: true, tight: true })}${card("Categories & budgets", cats, { tight: true })}</div>
     <div class="grid g2 mt start">${card("Your devices", devices, { id: "devices" })}${card("Your data", data, { b: true })}</div>
+    <div class="grid g2 mt start">${card("Apple Pay auto-log · beta", applePayBody())}</div>
     <div class="grid g2 mt start">${card("Bank file rules", rules, { tight: true })}${card("About", `<p class="small">Budget Planner by TrueHaven Studios · v${esc(window.BP_VERSION || "")}</p><p class="small muted">Questions or ideas? Send me a message on Etsy – I read every one. <a href="${esc(window.BP_SHOP)}" target="_blank" rel="noopener">TrueHavenStudios</a></p><p class="tiny faint">A planning tool, not financial advice. Updates come to the same link automatically.</p>`, { b: true })}</div>`;
 }
 function setSetting(k, v) {
@@ -2820,6 +2821,7 @@ addEventListener("hashchange", () => { closeModal(); render(); });
 
 const ACT = {
   close: () => closeModal(),
+  payHelp: () => payHelp(), payJoin: () => { closeModal(); SYNC.openJoin(); },
   mPrev: () => { VS.month = E.ymAdd(curMonth(), -1); render(); }, mNext: () => { VS.month = E.ymAdd(curMonth(), 1); render(); },
   yPrev: () => { VS.year = (VS.year || +today().slice(0, 4)) - 1; render(); }, yNext: () => { VS.year = (VS.year || +today().slice(0, 4)) + 1; render(); },
   moreNav: () => modal("Everything", NAV.map(([lab, items]) => `<div class="caps" style="margin:10px 0 4px">${lab}</div>` + items.map(([id, name, icon]) => `<a class="nav ${route() === id ? "on" : ""}" href="#/${id}">${ic(icon)}<span>${name}</span></a>`).join("")).join("")),
@@ -2959,6 +2961,130 @@ addEventListener("keydown", e => { if ((e.ctrlKey || e.metaKey) && e.key === "z"
 
 // service worker for offline use (only when served over http/https)
 if ("serviceWorker" in navigator && /^https?:/.test(location.protocol) && !window.BP_NO_SW) addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => { }));
+
+// ------------------------------------------------------------ Apple Pay auto-log
+// The iPhone Shortcuts automation "Transaction" (runs when you pay with a Wallet card) opens
+//   <haven link>#pay&a=<amount>&m=<merchant>      (or #pay&raw=<whatever the shortcut sends>)
+// The planner logs the spend: a merchant it has seen before gets that category, new ones open the spend dialog once.
+// Apple opens links in Safari, which keeps its own storage apart from the home-screen app. So a Safari copy that is
+// linked with TrueHaven Sync pulls first, logs, and pushes straight away; an unlinked, empty one keeps the spend
+// waiting and asks to be linked once.
+const PAY_KEY = "thbudget.paypending";
+const PAY_SHORTCUT = window.BP_PAY_SHORTCUT || "";
+const PAY_RULES = [
+  [/starbucks|coffee|caf[eé]|espresso|dunkin|tim horton|costa|pret|bakery|b[aä]cker|boulangerie|donut|bubble tea|boba/i, "coffee"],
+  [/grocer|market|aldi|lidl|coop|migros|denner|rewe|edeka|kroger|trader joe|whole foods|safeway|walmart|costco|tesco|sainsbury|asda|carrefour|albert heijn|spar\b|kaufland|penny|netto|publix|wegmans|heb\b|food lion|giant/i, "groceries"],
+  [/restaurant|pizza|burger|mcdonald|kfc|subway|chipotle|taco|sushi|ramen|kebab|grill|bistro|diner|kitchen|doordash|uber ?eats|deliveroo|just eat|wolt|chick-fil|wendy|domino|five guys|panera|nando/i, "eating"],
+  [/uber|lyft|taxi|bolt|metro|transit|train|rail|sbb|bahn|bus\b|parking|shell|bp\b|esso|chevron|exxon|texaco|fuel|gas station|tankstelle|avia|agrola/i, "transport"],
+  [/pharmacy|apotheke|drugstore|cvs|walgreens|boots|rite aid|dm\b|clinic|doctor|dental/i, "health"],
+  [/amazon|target|ikea|h&m|zara|uniqlo|primark|best buy|apple store|manor|galaxus|mediamarkt|shein|etsy|tj ?maxx|marshalls|old navy|gap\b/i, "shopping"],
+  [/cinema|kino|movie|theater|theatre|netflix|spotify|steam|playstation|xbox|nintendo|ticket|museum|bowling|concert/i, "fun"],
+  [/salon|barber|coiffeur|nail|spa\b|sephora|ulta|douglas|beauty/i, "beauty"],
+    [/hardware|home depot|lowe|bauhaus|hornbach|obi\b|jumbo|do it/i, "home"]
+];
+function payNum(t) {
+  t = String(t).replace(/[\s ']/g, "");
+  const neg = /^-|^\(|-$/.test(t); t = t.replace(/[^\d.,]/g, "");
+  const lc = t.lastIndexOf(","), ld = t.lastIndexOf(".");
+  if (lc > -1 && ld > -1) t = lc > ld ? t.replace(/\./g, "").replace(",", ".") : t.replace(/,/g, "");
+  else if (lc > -1) t = /,\d{1,2}$/.test(t) ? t.replace(/\./g, "").replace(",", ".") : t.replace(/,/g, "");
+  else if ((t.match(/\./g) || []).length > 1) t = t.replace(/\.(?=.*\.)/g, "");
+  const v = parseFloat(t); return isFinite(v) ? Math.round(Math.abs(v) * 100) / 100 * (neg ? -1 : 1) : NaN;
+}
+// pull the amount (and what's left: the merchant) out of whatever text the shortcut sent
+function payParse(a, m, raw) {
+  const CUR = "(?:[$€£¥₹₩₪₺₽]|CHF|Fr\\.?|EUR|USD|GBP|CAD|AUD|NZD|SEK|NOK|DKK|PLN|ZAR|INR|SGD|JPY|MXN|BRL|kr|zł)";
+  const NUM = "-?\\d[\\d.,'\\s\\u00a0]*\\d|-?\\d";
+  let amount = NaN, merchant = (m || "").trim();
+  if (a) { const mm = String(a).match(new RegExp(NUM)); if (mm) amount = payNum(mm[0]); }
+  if (!(amount > 0) && raw) {
+    const s = String(raw);
+    const re = [new RegExp(CUR + "\\s?(" + NUM + ")", "i"), new RegExp("(" + NUM + ")\\s?" + CUR, "i")];
+    let hit = null;
+    for (const r of re) { hit = s.match(r); if (hit) break; }
+    if (!hit) hit = s.match(/(-?\d+[.,]\d{2})(?!\d)/);
+    if (hit) {
+      amount = payNum(hit[1]);
+      if (!merchant) merchant = s.replace(hit[0], " ").replace(/\b(amount|merchant|card|name|transaction|apple pay|wallet)\b\s*:?/gi, " ").replace(/[•·*]{2,}\s*\d{2,4}/g, " ").replace(/\b(visa|mastercard|master card|amex|american express|maestro|debit card|credit card|debit|credit)\b/gi, " ").replace(/\s{2,}/g, " ").replace(/^[\s,;:|\-]+|[\s,;:|\-]+$/g, "");
+    }
+  }
+  merchant = merchant.split(/\n/)[0].trim().slice(0, 60);
+  return { amount, merchant };
+}
+function payPending() { try { return JSON.parse(localStorage.getItem(PAY_KEY) || "[]"); } catch (e) { return []; } }
+function paySetPending(l) { try { l.length ? localStorage.setItem(PAY_KEY, JSON.stringify(l.slice(-50))) : localStorage.removeItem(PAY_KEY); } catch (e) { } }
+// read a #pay link once, take it out of the address bar
+function takePay() {
+  const h = location.hash || "";
+  if (!/^#\/?pay(?:[&?]|$)/.test(h)) return null;
+  const q = new URLSearchParams(h.replace(/^#\/?pay[&?]?/, ""));
+  try { history.replaceState(null, "", location.pathname + location.search); } catch (e) { }
+  const p = payParse(q.get("a"), q.get("m"), q.get("raw") || q.get("t") || "");
+  return { ...p, at: now(), date: today(), key: (q.get("id") || "") + "|" + p.amount + "|" + p.merchant.toLowerCase() + "|" + Math.floor(now() / 90000), raw: (q.get("raw") || q.get("a") || "").slice(0, 120) };
+}
+
+function payCat(merchant) {
+  const k = merchant.toLowerCase(); if (!k) return null;
+  const rule = (S.rules || []).find(x => x.match && k.includes(x.match.toLowerCase()));
+  if (rule && S.cats.some(c => c.id === rule.cat)) return rule.cat;
+  const past = [...S.tx].reverse().find(t => t.kind === "out" && (t.note || "").trim().toLowerCase() === k && t.cat);
+  if (past && S.cats.some(c => c.id === past.cat)) return past.cat;
+  const r = PAY_RULES.find(([re]) => re.test(merchant));
+  return r && S.cats.some(c => c.id === r[1]) ? r[1] : null;
+}
+let payBusy = false;
+async function payRun(p) {
+  if (DEMO) { if (p && p.amount > 0) toast(`Apple Pay works in the full planner: ${fmt(p.amount)}${p.merchant ? " at " + esc(p.merchant) : ""}.`); return; }
+  const list = payPending(); if (p) list.push(p); paySetPending(list);
+  if (!list.length || payBusy) return;
+  if (!S.setup && !SYNC.linked) { payLinkPrompt(list.length); return; }
+  payBusy = true;
+  try { if (SYNC.linked) { try { await SYNC.cycle(); } catch (e) { } } } finally { payBusy = false; }
+  if (!S.setup) { payLinkPrompt(list.length); return; }
+  const todo = payPending(); paySetPending([]);
+  const acct = (E.primary(S) || S.accounts[0] || {}).id;
+  let ask = null; const add = [];
+  todo.forEach(x => {
+    if (!(x.amount > 0)) { toast(`Apple Pay: the planner couldn't read the amount${x.raw ? " (got “" + esc(x.raw) + "”)" : ""}. Add it by hand.`); return; }
+    if (S.tx.some(t => t.pid === x.key)) return;
+    const cat = payCat(x.merchant);
+    if (!cat && !ask) { ask = x; return; }
+    add.push({ id: uid(), ts: x.at || now(), kind: "out", amount: E.r2(x.amount), date: x.date || today(), note: x.merchant || "Apple Pay", cat: cat || "other", acct, tags: ["applepay"], src: "applepay", pid: x.key });
+  });
+  if (add.length) {
+    commit(() => add.forEach(t => S.tx.push(t)), "Apple Pay");
+    const t = add[add.length - 1];
+    toast(add.length === 1 ? `${catOf(t.cat).emoji} ${esc(t.note)} −${fmt(t.amount)} logged from Apple Pay` : `${add.length} Apple Pay spends logged`, () => undo());
+  }
+  if (ask) setTimeout(() => { txModal(null, ask.date); const a = $("#txA"), n = $("#txN"), tg = $("#txT"); if (a) a.value = E.r2(ask.amount); if (n) n.value = ask.merchant; if (tg) tg.value = "applepay"; }, add.length ? 900 : 250);
+  if (SYNC.linked) setTimeout(() => { flush(true); SYNC.cycle(); }, 150);
+}
+function payLinkPrompt(n) {
+  modal("One quick step", `<p>Apple opened your payment${n > 1 ? "s" : ""} here in Safari. The planner on your home screen keeps its own data, so link this copy once – after that every Apple Pay spend goes straight to your planner.</p>
+    <div class="list mt"><div class="item"><div class="grow small">1️⃣ Open the <b>Budget Planner</b> from your home screen → Settings → <b>Your devices</b> → <b>Link another device</b>.</div></div>
+    <div class="item"><div class="grow small">2️⃣ Come back here and tap <b>Type the code</b>.</div></div></div>
+    <p class="tiny muted mt">${n} payment${n > 1 ? "s are" : " is"} waiting and will be added as soon as you're linked. Only use the planner in Safari? Then just finish the setup here.</p>`,
+    `<button class="btn" data-act="close">Later</button><button class="btn pri" data-act="payJoin">Type the code</button>`);
+}
+function payHelp() {
+  const link = location.href.split("#")[0];
+  modal("Log Apple Pay automatically", `<p>Pay with Apple Pay on your iPhone and the spend adds itself. No bank login, nothing leaves your phone except to your own linked devices.</p>
+    <div class="list mt">
+    ${PAY_SHORTCUT ? `<div class="item"><div class="grow small">1️⃣ Tap <b>Add the shortcut</b> below and choose <b>Add Shortcut</b>.</div></div>` : `<div class="item"><div class="grow small">1️⃣ Shortcuts app → <b>+</b> → name it <b>Budget Pay</b>. Add <b>URL Encode</b> with <b>Shortcut Input</b>, then <b>Open URLs</b> with <b>${esc(link)}#pay&amp;raw=</b> and the <b>URL Encoded Text</b> right after it.</div></div>`}
+    <div class="item"><div class="grow small">2️⃣ Shortcuts app → <b>Automation</b> → <b>+</b> → <b>Transaction</b>. Pick your cards, choose <b>Run Immediately</b>, tap <b>Next</b>.</div></div>
+    <div class="item"><div class="grow small">3️⃣ <b>New Blank Automation</b> → add <b>Run Shortcut</b> → pick <b>Budget Pay</b> → tap the arrow and set Input to <b>Shortcut Input</b> → Done.</div></div>
+    <div class="item"><div class="grow small">4️⃣ Pay with Apple Pay. The planner opens for a second and adds it. A new shop asks for its category once, after that it's automatic (your bank file rules work too).</div></div></div>
+    <p class="tiny muted mt">New and still in beta: if anything looks off, send me a message on Etsy and I'll fix it. Works on iPhone with iOS 17 or newer, for payments with your phone or Apple Watch in shops. Card swipes and online payments you still add yourself. Using the planner from your home screen? The first payment asks you to link Safari once.</p>`,
+    `${PAY_SHORTCUT ? `<a class="btn pri" href="${esc(PAY_SHORTCUT)}" target="_blank" rel="noopener">Add the shortcut</a>` : ""}<button class="btn" data-act="close">Done</button>`, { wide: true });
+}
+function applePayBody() {
+  const n = S.tx.filter(t => t.src === "applepay").length;
+  return `<p class="small">iPhone: pay with Apple Pay and the spend adds itself. Set up once in the Shortcuts app.</p><div class="row wrap mt"><button class="btn pri" data-act="payHelp">Set it up</button></div>${n ? `<p class="help">${n} spend${n > 1 ? "s" : ""} added from Apple Pay so far.</p>` : ""}`;
+}
+window.addEventListener("hashchange", () => { const p = takePay(); if (p) payRun(p); });
+setTimeout(() => { const p = takePay(); if (p || payPending().length) payRun(p); }, 400);
+setInterval(() => { if (payPending().length && S.setup && !payBusy && !document.querySelector(".scrim")) payRun(null); }, 4000);
+
 render();
 </script>
 </body></html>
